@@ -63,18 +63,21 @@ QQ 客户端（手机/电脑） ⇄ NapCat（OneBot v11，WebSocket）
 | 课程内容 | 项目中的用途 | 选择理由与复杂度 |
 | --- | --- | --- |
 | **哈希表**（`dict` / `set` / `Map`） | ① `openid → 记忆`、`QQ 号 → 印象`、`备注名 → QQ 号` 的索引；② `msg_id` 去重集合；③ 表情名 → 文件路径 | 平均 $O(1)$ 查找。去重必须用 `Set` 而不是数组 `includes`（$O(n)$），否则每条消息都要扫全表 |
-| **环形缓冲（ring buffer）** | 每个会话最近 N 轮对话、消息去重窗口（500 条）、群聊热度窗口 | 固定容量、$O(1)$ 摊还插入，避免长时间运行内存无界增长 |
-| **LRU 缓存**（用 `Map` 的插入有序性实现） | 识图结果缓存、搜索结果缓存 | 命中 $O(1)$；超容量删最旧（`Map.keys().next()`）。比引入第三方库更轻 |
-| **堆 / 优先队列** | 提醒与课表的「下一条该提醒什么」 | 规模小（几十条），用**按时间排序的数组 + 二分定位**更简单：插入 $O(\log n)$ 查找 + $O(n)$ 移动，实际 n<100 时优于堆的常数 |
-| **二分查找** | 在按时间排好序的日程/课表里找「下一个到期」、找今天第几节课 | $O(\log n)$，避免每秒轮询全表 |
-| **前缀和 / 滑动窗口** | 群聊热度统计（近 60 秒多少人、多少条）、限流配额（每小时条数） | 用「按分钟分桶的计数数组 + 窗口求和」，把 $O(n)$ 的重复统计降到 $O(1)$ 更新 |
+| **环形缓冲（ring buffer）** ★ | ① 每个会话最近 N 轮对话（`src/memory.js` 的 `RingBuffer`）；② `msg_id` 去重窗口 500 条（`src/onebot.js` 的 `_dedupeRing`）；③ 每小时发言时间戳 | **真环形**：固定容量数组 + 头指针 + 长度，满了覆盖最旧位置。写入 $O(1)$、不需要搬数据——对比 `slice(-N)` / `shift()` 的 $O(n)$ |
+| **FIFO 缓存**（用 `Map` 的插入有序性实现） | 识图结果缓存、搜索结果缓存 | 命中 $O(1)$；超容量删最早插入的（`Map.keys().next()`）。比引入第三方库更轻 |
+| **二分查找** ★ | 提醒调度「现在该发哪些」（`src/reminders.js` 的 `lowerBound`） | 待办按时间升序维护；`due(t)` 用**两次二分**框出 $[t-\text{grace}, t]$ 区间，$O(\log n)$ 定位后只对候选判断——取代了原来的「全表 `filter` + `sort`」 |
+| **分桶 + 滑动窗口** ★ | 群聊热度（近 60 秒多少人、多少条） | 每条消息只往「当前这一分钟」的桶里 +1（更新 $O(1)$），查询时把窗口内的几个桶相加（$O(\text{窗口分钟数})$，与历史条数无关） |
 | **贪心** | 长回复切分成多条气泡（尽量在句末标点切、每段 ≤ N 字） | 局部最优即全局可接受；不需要 DP（代价函数单调） |
-| **双指针** | 分段时「先找句末标点，找不到再退到弱标点」 | 一次线性扫描 $O(n)$，不产生临时数组 |
+| **双指针 / 线性扫描** | 分段时「先扫句末标点，没有再退到弱标点」；缓存过期清理只丢前缀 | 一次线性扫描 $O(n)$，不产生临时数组 |
 | **字符串处理** | 中文标点补全、全角/半角归一、按 UTF-16 码元安全截断 | 见 §2.3 的「按长度截断」陷阱 |
-| **BM25 检索**（倒排索引） | 本地知识库问答 | 查询 $O(\sum_{t} df_t)$，只对被查询词命中的文档算分，不扫全库 |
+| **BM25 检索 + 倒排索引** ★ | 本地知识库问答（`src/knowledge.js`） | 建索引时同时维护 `postings: 词项 → 文档下标集合`；查询先取各查询词倒排表的**并集**得到候选文档，**只对候选算分**，不遍历全库 |
 | **指数退避** | 网关重连、API 限流重试 | 失败等待 $b \cdot r^k$（$r=1.4/1.8$，上限 60s），避免重试风暴 |
 | **租约 / 心跳（lease）** | 防止同一账号起两个机器人实例（否则同一条消息会回两遍） | 写心跳文件，`now - mtime > 20s` 视为过期；等价于分布式系统的 lease，只是单机用文件实现 |
 | **幂等** | 同 `msg_id` 重复推送只处理一次；发件箱失败重试不重复发送 | 用「已处理集合 + 状态文件」实现 at-most-once 的效果 |
+
+> ★ 标记的五项在 `tools/algo-check.js` 里有自动校验：跑一下就能确认这些结构在源码里真实存在（而不是文档里写着好看）。
+
+> 复杂度取舍说明：提醒队列的规模最多几十条，理论上也可以直接排序；但因为「每秒轮询 + 全表重排」在长时间运行下是稳定浪费，项目里改成了**维护有序 + 二分定位**，代价是插入时多一次 `sort`（$n$ 很小，$O(n\log n)$ 可忽略）。群热度同理：原来每次判定都要 `filter` 一遍说话记录，改成桶之后历史记录也不会无限变长。
 
 ### 2.2 三个值得说的算法点
 
@@ -132,7 +135,7 @@ QQ 客户端（手机/电脑） ⇄ NapCat（OneBot v11，WebSocket）
 | 群聊平均回复 | ≈1.07 s（P90 2.4 s） | 群聊用更小 `maxTokens` 与更短历史 |
 | 单条消息处理内存 | O(1) 摊还 | 环形缓冲固定容量 |
 | 提示词规模 | ≈320 token | 三层优化后（历史截断/摘要/按需检索） |
-| 测试 | 56 个文件、约 1974 条断言、全绿（3 个按环境自动 SKIP） | `npm test` |
+| 测试 | 60 个测试脚本 + 5 个测试数据文件、约 1339 处断言、全绿（3 个按环境自动 SKIP） | `npm test` |
 
 ---
 
@@ -140,7 +143,7 @@ QQ 客户端（手机/电脑） ⇄ NapCat（OneBot v11，WebSocket）
 
 ```text
 repo/
-├── src/                  # 48 个模块，约 12.7k 行（零第三方依赖）
+├── src/                  # 48 个模块，约 15.1k 行（零第三方依赖）
 │   ├── onebot.js         # OneBot v11 接入层：连接/重连/消息归一化/发送
 │   ├── responder.js      # 会话调度核心：该不该回、怎么回、回几段
 │   ├── brain.js          # 模型层：提示词组装、chat、识图、摘要
@@ -156,7 +159,7 @@ repo/
 │   ├── instance-lock.js  # 单实例租约锁
 │   ├── outbox.js         # 发件箱（失败重试 / 上线补发）
 │   └── ...               # search / weather / vision / modes / handover ...
-├── test/                 # 56 个测试文件，约 1974 条断言
+├── test/                 # 60 个测试脚本 + 5 个数据文件，约 1339 处断言
 ├── assets/               # 表情索引示例与占位图
 ├── tools/run-tests.js    # 测试入口（自动准备 config.json）
 ├── docs/                 # 报告、架构图、演示材料
@@ -170,14 +173,40 @@ repo/
 
 ### 4.1 环境
 
-- Node.js **≥ 20**（用到内置 `globalThis.WebSocket`，推荐 **22/24**）
+- Node.js **≥ 22**（用到内置 `globalThis.WebSocket`，与 `package.json` 的 `engines` 一致）
 - 一个 OneBot v11 协议端（如 NapCat），暴露 `ws://127.0.0.1:3001`
 - 一个支持 OpenAI 兼容接口的大模型 API（本项目按 `deepseek-chat` 调通）
 
-### 4.2 步骤
+### 4.2 一键安装（推荐）
+
+**Windows**（PowerShell，双击 `install.cmd` 也行）：
+
+```powershell
+irm https://raw.githubusercontent.com/illenial-eml/QQCompanion/main/install.ps1 | iex
+```
+
+**macOS / Linux / WSL**：
 
 ```bash
-git clone <this-repo> QQCompanion && cd QQCompanion
+curl -fsSL https://raw.githubusercontent.com/illenial-eml/QQCompanion/main/install.sh | bash
+```
+
+脚本会依次做五件事：检查 Node/git → 克隆或更新代码 → 从模板生成 `config.json`（**已存在就绝不覆盖**）→ 建 `data/` → 跑一遍离线自检。幂等，重复执行安全。
+
+常用参数：`-Dir D:\QQCompanion`（Windows）/ `QC_DIR=~/QC`（Linux）指定目录，`-NoTest` / `QC_NO_TEST=1` 跳过自检。
+
+也可以只跑安装向导（不克隆，适合已经拿到代码的情况）：
+
+```bash
+node tools/install.js          # 安装：检查 → 生成配置 → 自检
+node tools/install.js --dry    # 只看会做什么，不改文件
+node tools/install.js --check  # 只体检
+```
+
+### 4.3 手动安装
+
+```bash
+git clone https://github.com/illenial-eml/QQCompanion.git && cd QQCompanion
 cp config.example.json config.json     # 填写 apiKey / onebot.url / onebot.accessToken
 node tools/run-tests.js                # 先确认本机环境（会打印每一组结果）
 node src/onebot-main.js                # 启动机器人
@@ -189,12 +218,11 @@ node src/onebot-main.js                # 启动机器人
 {
   "brain": { "apiKey": "sk-your-key", "model": "deepseek-chat" },
   "onebot": { "url": "ws://127.0.0.1:3001", "accessToken": "your-token", "selfId": "1000000001" },
-  "owner": { "ids": ["1000000002"] },
-  "qq": { "botNames": ["小鸿"] }
+  "qq": { "botNames": ["小鸿"], "ownerIds": ["1000000002"] }
 }
 ```
 
-### 4.3 最小使用示例
+### 4.4 最小使用示例
 
 ```
 你：在干嘛呢
@@ -232,7 +260,7 @@ node test/responder-behavior.js  # 单个
 
 ![测试全绿：通过 53 跳过 3 失败 0 共 56](docs/screenshots/test-run.png)
 
-**失败案例**（如实记录，详见 `docs/项目报告.md` 第 7 节）：TDZ 崩溃循环、双实例双回复、群聊过期消息答非所问、PowerShell 写坏中文导致的配置解析失败。
+**失败案例**（如实记录，详见 `docs/项目报告.md` §5.2）：TDZ 崩溃循环、双实例双回复、群聊过期消息答非所问、PowerShell 写坏中文导致的配置解析失败。
 
 ---
 
@@ -272,10 +300,10 @@ node test/responder-behavior.js  # 单个
   - 全部代码的阅读、修改与验收；真机部署与运维（进程守护、电源策略、掉线排查）
   - 测试用例的补充与失败复现；本文档的事实核对
 验证方法及结果：
-  - 56 个测试文件 / 约 1974 条断言全部通过（3 个按环境 SKIP）
+  - 60 个测试脚本 / 约 1339 处断言全部通过（3 个按环境 SKIP）
   - 真机运行：私聊首响 0.8–1.3s；群聊平均 1.07s；连续运行数天并记录掉线原因
   - 对每个结论做可复现验证（日志、脚本、对照实验），失败的假设如实记录
-代表性协作案例：docs/项目报告.md 第 7 节（三次「AI 判断错了、靠验证纠回来」的实录）
+代表性协作案例：docs/项目报告.md §5.2（三次「AI 判断错了、靠验证纠回来」的实录）
 引用与复用的外部资源：
   - OneBot v11 协议规范（https://github.com/botuniverse/onebot-11）
   - NapCat 协议端（https://github.com/NapNeko/NapCatQQ）
