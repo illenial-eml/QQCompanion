@@ -426,10 +426,40 @@ function createReminderStore({ file, cfg = {}, log = null, now = Date.now } = {}
     return state.items.filter((it) => !it.doneAt).sort((a, b) => a.at - b.at);
   }
 
-  /** 到点未发的提醒（按时间升序） */
+  /**
+   * 二分查找：在按时间升序排好的数组里，找第一个 at >= t 的下标（lower_bound）
+   *
+   * 为什么需要它：老写法是「每次轮询都把待办全表 filter + sort 一遍再筛选」，
+   * 每秒都做一次 O(n log n)。现在待办列表始终保持有序，查「该提醒哪些」
+   * 只要两次二分就能框出候选区间（O(log n)），再只对这些候选判断宽限期。
+   */
+  function lowerBound(arr, t, key = (x) => x.at) {
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (key(arr[mid]) < t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  /** 待办列表（不含已完成的），按时间升序——保持有序，二分查找才成立 */
+  function pendingSorted() {
+    return state.items.filter((it) => !it.doneAt).sort((a, b) => a.at - b.at);
+  }
+
+  /**
+   * 到点未发的提醒（按时间升序）
+   * 用二分定位到「第一条 at > t」的位置，往前回溯到「还在宽限期内」的那条为止。
+   */
   function due(t = now()) {
     const graceMs = (conf.lateGraceHours || 12) * 3600000;
-    return listPending().filter((it) => it.at <= t && (t - it.at) <= graceMs);
+    const arr = pendingSorted();
+    if (!arr.length) return [];
+    const end = lowerBound(arr, t + 1);          // 第一个 at > t 的位置
+    const start = lowerBound(arr, t - graceMs);  // 第一个 at >= t - graceMs 的位置
+    return arr.slice(start, end);                // 已经有序，不用再排序
   }
 
   /** 超期太久、已经没必要补发的（标完成，避免一直挂着） */
