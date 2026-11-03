@@ -40,7 +40,7 @@
       "maxChars": 120
     },
     "ownerIds": [
-      "你的openid（私聊日志里那串 A96C…）"
+      "你的openid（官方版才用，32 位十六进制串）"
     ],
     "ownerNames": [
       "你的群昵称"

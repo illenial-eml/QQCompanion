@@ -228,7 +228,7 @@ async function main() {
     cfg: { ...(cfg.reminders || {}) },
     log,
   });
-  // 修过：ownerIds 里第一个是官方版的 openid（A96CFB…），NapCat 只认 QQ 号，
+  // 修过：ownerIds 里第一个是官方版的 openid（如 A1B2C3…），NapCat 只认 QQ 号，
   // 直接拿去发会报「1200 请指定正确的 group_id 或 user_id」。
   // 这里优先取纯数字的账号（真实 QQ 号），没有再退回第一个。
   const ownerIdForReminder = (() => {
@@ -852,7 +852,10 @@ async function main() {
     const isDown = /^(我下号|我下了号|你上号|交给你|交还给你|我完事了|我用完了|电脑接回去)$/.test(t0);
     if (!isUp && !isDown) return false;
 
-    const stateFile = 'D:\\napcat\\state-handoff.txt';
+    // 交接脚本的位置不写死：默认放在工作目录下的 handoff/ 里，
+    // 也可以用环境变量 NAPCAT_HANDOFF_DIR 或 qq.handoffDir 覆盖（换机器不用改代码）。
+    const handoffDir = process.env.NAPCAT_HANDOFF_DIR || cfg.qq?.handoffDir || path.join(ROOT, 'handoff');
+    const stateFile = path.join(handoffDir, 'state-handoff.txt');
     if (isDown) {
       try { fs.unlinkSync(stateFile); } catch { /* 本来就没在交接 */ }
       await client.sendC2C(msg.userId, '好，我拿回来了，正在重新登录，等我一下。').catch(() => {});
@@ -865,10 +868,15 @@ async function main() {
       '好，我这就下线，手机上去看吧。看完了在电脑上点「交还给电脑」，或者发我「我下号」。',
     ).catch(() => {});
     log.info('交接模式：接到「' + t0 + '」，准备让出登录权');
+    const script = path.join(handoffDir, 'handoff.ps1');
+    if (!fs.existsSync(script)) {
+      log.warn(`交接模式：找不到 ${script}（可用 NAPCAT_HANDOFF_DIR 指定目录），这次只回消息不真下线`);
+      return true;
+    }
     setTimeout(() => {
       try {
         require('child_process')
-          .spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'D:\\napcat\\handoff.ps1', '-Action', 'up'], {
+          .spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Action', 'up'], {
             detached: true,
             stdio: 'ignore',
           })

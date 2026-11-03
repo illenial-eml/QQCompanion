@@ -49,8 +49,8 @@ const DEFAULTS = {
       reactMinIntervalSec: 300, // 同一个群两次贴表情的最小间隔（秒）
     },
     groupLog: {
-      enabled: true,          // 把每个群最近说过的话单独存一份
-      injectInPrivate: true,  // 私聊时带上「群里最近在聊什么」，方便你问群里的情况
+      enabled: true,          // 把每个群最近说过的话单独存一份（只存本地 data/groups/）
+      injectInPrivate: false, // 默认不把群聊内容塞进私聊提示词；要带就设 true
       hours: 8,               // 私聊里带最近多少小时内的群聊
       perGroup: 6,            // 每个群带几条
       maxGroups: 4,           // 最多带几个群

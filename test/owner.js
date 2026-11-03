@@ -103,8 +103,8 @@ const groupMsg = (id, content, over = {}) => ({
 
   // 2. 按 openid 认人（私聊）
   {
-    const store = createOwnerStore({ cfg: { ids: ['A96CFBBC1C6382B670B80E03A1EDD71E'] }, log: silentLog });
-    assert.equal(store.match({ scene: 'c2c', userId: 'A96CFBBC1C6382B670B80E03A1EDD71E', userName: '谁' }).owner, true);
+    const store = createOwnerStore({ cfg: { ids: ['0123456789ABCDEF0123456789ABCDEF'] }, log: silentLog });
+    assert.equal(store.match({ scene: 'c2c', userId: '0123456789ABCDEF0123456789ABCDEF', userName: '谁' }).owner, true);
     assert.equal(store.match({ scene: 'c2c', userId: 'OTHER' }).owner, false);
     console.log('✓ 按 openid 认人');
   }

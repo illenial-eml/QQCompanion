@@ -8,6 +8,11 @@
  *   所以这里把群里的发言额外记一份，私聊时当成「你不在场时的其他场景」塞进提示词。
  *
  * 只存文字（表情/图片/语音会被过滤），单个群最多 maxLines 条，总字数有上限。
+ *
+ * 隐私边界要讲清楚（别记混）：
+ *   - 群里的发言**不进**「聊天记忆」（memory 里只记被 @ / 指名说到的那些）
+ *   - 但会**进**这里的群日志（每条截 maxChars 字，最多 maxLines 条，只在本地 data/groups/ 下）
+ *   - injectInPrivate 默认 false：默认不把群聊内容塞进私聊提示词；要用就显式打开
  */
 
 const fs = require('node:fs');
@@ -19,7 +24,7 @@ const GROUP_LOG_DEFAULTS = {
   maxLines: 200,        // 每个群最多留多少条
   maxChars: 120,        // 单条最多存多少字
   saveDelayMs: 2000,    // 攒一下再写盘（群里消息密，别每条都写文件）
-  injectInPrivate: true, // 私聊时把群里最近的情况带进提示词
+  injectInPrivate: false, // 默认不把群聊内容带进私聊提示词（要带就显式设 true）
   hours: 8,             // 私聊里带最近多少小时内的群聊
   perGroup: 6,          // 每个群带几条
   maxGroups: 4,         // 最多带几个群
