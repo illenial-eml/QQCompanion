@@ -21,6 +21,9 @@ const path = require('path');
 /** Node 24 自带标准 WebSocket，零依赖直接用（addEventListener 那套接口） */
 const WS = globalThis.WebSocket;
 
+/** msg_id 去重的容量：保留最近这么多条消息的 id（够挡住腾讯的重复推送） */
+const DEDUPE_CAPACITY = 500;
+
 const ONEBOT_DEFAULTS = {
   enabled: true,
   url: 'ws://127.0.0.1:3001',   // NapCat 的「WebSocket 服务器」地址
@@ -131,7 +134,7 @@ class OneBotClient extends EventEmitter {
     this._closedByUser = false;
     this._reconnectTimer = null;
     this._dedupe = new Set();
-    this._dedupeOrder = [];
+    this._dedupeRing = null;   // {buf, head, len} —— 定长环形缓冲，见 _isDuplicate()
   }
 
   // ================= 连接 =================
@@ -388,15 +391,30 @@ class OneBotClient extends EventEmitter {
     this.log?.debug?.('notice:', ev.notice_type, ev.sub_type || '');
   }
 
+  /**
+   * msg_id 去重：定长环形缓冲 + 集合双写
+   *
+   * 老写法用 `_dedupeOrder.shift()` 淘汰最旧的，而 shift 要把后面所有元素前移，
+   * 单次 O(n)。这里用「固定容量数组 + 头指针 + 长度」的环形缓冲，
+   * 满了就覆盖最旧的那个位置：写入 O(1)，不需要搬数据。
+   */
   _isDuplicate(id) {
     const key = String(id || '');
     if (!key) return false;
     if (this._dedupe.has(key)) return true;
     this._dedupe.add(key);
-    this._dedupeOrder.push(key);
-    if (this._dedupeOrder.length > 500) {
-      const old = this._dedupeOrder.shift();
-      this._dedupe.delete(old);
+
+    const cap = DEDUPE_CAPACITY;
+    if (!this._dedupeRing) this._dedupeRing = { buf: new Array(cap), head: 0, len: 0 };
+    const ring = this._dedupeRing;
+    if (ring.len < cap) {
+      ring.buf[(ring.head + ring.len) % cap] = key;
+      ring.len += 1;
+    } else {
+      const evicted = ring.buf[ring.head];
+      ring.buf[ring.head] = key;
+      ring.head = (ring.head + 1) % cap;
+      if (evicted !== undefined) this._dedupe.delete(evicted);
     }
     return false;
   }
