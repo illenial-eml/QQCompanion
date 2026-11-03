@@ -21,17 +21,30 @@ const TEST_DIR = path.join(ROOT, 'test');
 function ensureConfig() {
   const conf = path.join(ROOT, 'config.json');
   const example = path.join(ROOT, 'config.example.json');
-  if (fs.existsSync(conf) || !fs.existsSync(example)) return;
-  const cfg = JSON.parse(fs.readFileSync(example, 'utf8').replace(/^\uFEFF/, ''));
+  if (!fs.existsSync(example)) return;
+
+  const had = fs.existsSync(conf);
+  const cfg = had
+    ? JSON.parse(fs.readFileSync(conf, 'utf8').replace(/^\uFEFF/, ''))
+    : JSON.parse(fs.readFileSync(example, 'utf8').replace(/^\uFEFF/, ''));
+
+  // 占位凭据只在「空着 / 还是模板里的说明文字」时才填：
+  // 这样全新 clone 能跑通，而你自己填过的真 key 永远不会被覆盖。
+  let touched = false;
+  const isBlank = (v) => v === undefined || v === null || v === '' || /^你的|^<|placeholder/i.test(String(v));
   cfg.brain = cfg.brain || {};
-  cfg.brain.apiKey = 'sk-placeholder-replace-me';
-  // 官方机器人通道的凭据用假值填上，方便启动冒烟测试跑通（不会真的联网）
+  if (!had || isBlank(cfg.brain.apiKey)) { cfg.brain.apiKey = 'sk-placeholder-replace-me'; touched = true; }
   cfg.qq = cfg.qq || {};
-  cfg.qq.appId = '0000000000';
-  cfg.qq.clientSecret = 'placeholder-secret';
-  if (cfg.onebot) cfg.onebot.accessToken = cfg.onebot.accessToken || '';
-  fs.writeFileSync(conf, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
-  console.log('[setup] 已从 config.example.json 生成 config.json（占位凭据，仅用于跑测试）\n');
+  if (!had || isBlank(cfg.qq.appId)) { cfg.qq.appId = '0000000000'; touched = true; }
+  if (!had || isBlank(cfg.qq.clientSecret)) { cfg.qq.clientSecret = 'placeholder-secret'; touched = true; }
+
+  if (!had) {
+    fs.writeFileSync(conf, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+    console.log('[setup] 已从 config.example.json 生成 config.json（占位凭据，仅用于跑测试）\n');
+  } else if (touched) {
+    fs.writeFileSync(conf, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+    console.log('[setup] config.json 里的凭据是空的，已临时填入占位值（仅用于跑测试）\n');
+  }
 }
 
 function main() {
