@@ -12,6 +12,71 @@ const NAME_MAP = {
   assistant: 'assistant',
 };
 
+/**
+ * 定长环形缓冲（用于最近 N 轮对话）
+ *
+ * 之前用 `arr.push(...)` + `arr.slice(-N)` / `arr.shift()`：
+ * 每次越界都要整块移动元素，单条 O(n)，条数一多就不再是常数开销。
+ * 改成固定容量数组 + 头指针 + 长度：
+ *   - 入队：写到 (head + len) % cap，满了就把 head 前移一格覆盖最旧的
+ *   - 出队：head 前移，len--
+ * 两件事都是 O(1)，不需要搬数据。
+ */
+class RingBuffer {
+  constructor(capacity) {
+    this.capacity = Math.max(1, capacity | 0);
+    this.buf = new Array(this.capacity);
+    this.head = 0;   // 最旧元素所在下标
+    this.len = 0;
+  }
+
+  get size() { return this.len; }
+  get full() { return this.len === this.capacity; }
+
+  /** 下标 0 是最旧、len-1 是最新 */
+  at(i) {
+    if (i < 0 || i >= this.len) return undefined;
+    return this.buf[(this.head + i) % this.capacity];
+  }
+
+  push(x) {
+    if (this.len < this.capacity) {
+      this.buf[(this.head + this.len) % this.capacity] = x;
+      this.len += 1;
+      return null;            // 没被挤掉的
+    }
+    const evicted = this.buf[this.head];   // 覆盖最旧的
+    this.buf[this.head] = x;
+    this.head = (this.head + 1) % this.capacity;
+    return evicted;
+  }
+
+  shift() {
+    if (!this.len) return undefined;
+    const x = this.buf[this.head];
+    this.buf[this.head] = undefined;
+    this.head = (this.head + 1) % this.capacity;
+    this.len -= 1;
+    return x;
+  }
+
+  /** 从头到尾展开成普通数组（只在需要交给模型时调用） */
+  toArray() {
+    const out = new Array(this.len);
+    for (let i = 0; i < this.len; i += 1) out[i] = this.buf[(this.head + i) % this.capacity];
+    return out;
+  }
+
+  static from(arr, capacity) {
+    const rb = new RingBuffer(capacity);
+    for (const x of arr) rb.push(x);
+    return rb;
+  }
+}
+
+/** 每个 id 一份：ring 是真身，m.turns 保持与它同步（兼容老代码直接读 turns） */
+const RINGS = new WeakMap();
+
 class MemoryStore {
   constructor({ dir, maxTurns = 24, maxChars = 12000, log }) {
     this.dir = dir;
@@ -39,19 +104,21 @@ class MemoryStore {
       }
     }
     this.cache.set(id, data);
+    RINGS.set(data, RingBuffer.from(data.turns || [], this.maxTurns));
     return data;
   }
 
   addTurn(id, role, content) {
     const m = this.get(id);
-    m.turns.push({ role: NAME_MAP[role] || role, content: String(content), at: Date.now() });
-    // 条数截断
-    if (m.turns.length > this.maxTurns) m.turns = m.turns.slice(-this.maxTurns);
-    // 字符数截断（防止一次超长消息把上下文撑爆）
-    let total = m.turns.reduce((n, t) => n + t.content.length, 0);
-    while (total > this.maxChars && m.turns.length > 2) {
-      total -= m.turns.shift().content.length;
+    const ring = RINGS.get(m);
+    ring.push({ role: NAME_MAP[role] || role, content: String(content), at: Date.now() });
+    // 字符数截断（防止一次超长消息把上下文撑爆）；环形缓冲保证条数上限 O(1)
+    let total = 0;
+    for (let i = 0; i < ring.size; i += 1) total += ring.at(i).content.length;
+    while (total > this.maxChars && ring.size > 2) {
+      total -= ring.shift().content.length;
     }
+    m.turns = ring.toArray();
     m.updatedAt = Date.now();
     this.save(id);
   }
@@ -128,10 +195,13 @@ class MemoryStore {
 
   save(id) {
     const m = this.get(id);
+    // 真身是环形缓冲，落盘前展开成普通数组（保证 JSON 里就是时间顺序）
+    const ring = RINGS.get(m);
+    const data = ring ? { ...m, turns: ring.toArray() } : m;
     const f = this._file(id);
     const tmp = f + '.tmp';
     try {
-      fs.writeFileSync(tmp, JSON.stringify(m, null, 2), 'utf8');
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
       fs.renameSync(tmp, f);
     } catch (e) {
       this.log?.error('写记忆失败', f, e.message);
@@ -139,4 +209,4 @@ class MemoryStore {
   }
 }
 
-module.exports = { MemoryStore };
+module.exports = { MemoryStore, RingBuffer };
