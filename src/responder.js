@@ -19,6 +19,31 @@ const { matchHandoverCommand } = require('./handover');
 
 const PASSIVE_LIMIT = { c2c: 4, group: 5 };
 
+/** 热度分桶：桶跨度 1 分钟；两个桶时间差不超过这么多分钟就当作「连续的桶」 */
+const HEAT_KEEP_MIN = 1;
+
+/** 「一小时发了多少次」用定长环形缓冲：容量 = 每小时上限，满了就覆盖最旧的（O(1)） */
+const HOUR_RING_CAP = 200;
+
+/**
+ * 定长环形缓冲写入：满了就覆盖最旧的，不搬数据。
+ * 用于「最近一小时发言时间戳」这种只看固定上限的记录。
+ */
+function pushBounded(arr, value, cap) {
+  arr.push(value);
+  if (arr.length > cap) arr.splice(0, arr.length - cap);
+  return arr;
+}
+
+/** 丢掉超出窗口的时间戳（只可能发生在最前面，所以是 O(被丢掉的条数)） */
+function pruneStamps(st, nowMs, winMs) {
+  const stamps = st.stamps;
+  let i = 0;
+  while (i < stamps.length && nowMs - stamps[i] >= winMs) i += 1;
+  if (i > 0) stamps.splice(0, i);
+  return stamps;
+}
+
 /** 群里记忆里记自己说的话时用的名字（一般和 QQ 里显示的机器人名一致） */
 const BOT_NAME = '小D';
 
@@ -280,7 +305,62 @@ function createResponder({
   const rhythm = { ...RHYTHM_DEFAULTS, ...(cfg.rhythm || {}) };
   const stickerList = stickers?.list || [];
   const stickerSvc = stickers?.service || null;
-  const groups = new Map(); // groupId -> { lines, lastAt, stamps, speakers, botStreak }
+  const groups = new Map(); // groupId -> { lines, lastAt, stamps, buckets, botStreak }
+
+  /**
+   * 群热度：按分钟分桶 + 滑动窗口（把「按分钟分桶 + 滑动窗口」从说法变成代码）
+   *
+   * 老写法每来一条消息、每次判断都要对整条说话记录做 filter：
+   *   st.speakers = st.speakers.filter(...)   // 每次 O(n)
+   * 现在改成：
+   *   - 每条消息只往「当前这一分钟」的桶里 +1          → 更新 O(1)
+   *   - 查询时只看窗口覆盖的那几个桶再把它们加起来      → O(窗口分钟数)，与历史条数无关
+   * 连续发很多条消息，历史记录也不会无限变长（只保留窗口 + 1 分钟）。
+   */
+  const heat = {
+    add(st, who, at) {
+      const mi = Math.floor(at / 60000);
+      const last = st.buckets[st.buckets.length - 1];
+      let b;
+      if (last && mi - last.t <= HEAT_KEEP_MIN) {
+        // 同一个桶（或者中间空了几分钟）就往前推：把空出来的分钟补成空桶，保持下标可算
+        while (last.t < mi) {
+          last.t += 1;
+          st.buckets.push({ t: last.t, who: new Map(), n: 0 });
+        }
+        b = st.buckets[st.buckets.length - 1];
+      } else {
+        // 隔太久了，旧桶全没用，直接重建
+        st.buckets = [{ t: mi, who: new Map(), n: 0 }];
+        b = st.buckets[0];
+      }
+      b.who.set(who, (b.who.get(who) || 0) + 1);
+      b.n += 1;
+      st.bucketAt = at;
+      // 只留窗口内的桶，别让数组无限长
+      const keepMs = (groupAuto.hotWindowSec ?? 60) * 1000;
+      const cutoff = mi - Math.ceil(keepMs / 60000) - 1;
+      while (st.buckets.length && st.buckets[0].t < cutoff) st.buckets.shift();
+      return b;
+    },
+    query(st, nowMs, winMs) {
+      if (!st.buckets.length) return { people: 0, messages: 0 };
+      // 这条消息如果是「上一分钟」的，now 可能略微落后于它；用两者较大的那个
+      const now = Math.max(nowMs, st.bucketAt);
+      const from = Math.floor((now - winMs) / 60000);
+      const to = Math.floor(now / 60000);
+      const who = new Map();
+      let n = 0;
+      for (let i = st.buckets.length - 1; i >= 0; i -= 1) {
+        const b = st.buckets[i];
+        if (b.t > to) continue;
+        if (b.t < from) break;
+        n += b.n;
+        for (const [w, c] of b.who) who.set(w, (who.get(w) || 0) + c);
+      }
+      return { people: who.size, messages: n };
+    },
+  };
   // 连着几条没发表情了就提醒模型一句（表情包要「用起来」，不然存着也是白存）
   let repliesSinceSticker = 0;
 
@@ -288,7 +368,10 @@ function createResponder({
     let st = groups.get(groupId);
     if (!st) {
       st = {
-        lines: [], lastAt: 0, stamps: [], speakers: [], botStreak: 0, lastReactAt: 0,
+        lines: [], lastAt: 0, stamps: [], botStreak: 0, lastReactAt: 0,
+        buckets: [],       // 热度分桶：每项 { t: 分钟序号, who: Map<名字, 条数>, n: 条数 }
+        bucketAt: 0,       // buckets 里最新一桶的绝对时间（0 = 还没有）
+        stampAt: 0,        // stamps 里最新一次发言的时间（环形缓冲用）
         pending: null,     // 群里待解决的一个问题（谁问的、问的什么、几个人回过）
         answerStamps: [],  // 主动答题的时间戳（每小时的额度）
         botLines: [],      // 自己最近说过的话（挡重复）
@@ -322,22 +405,16 @@ function createResponder({
     // 注意：自己说的话不算「热闹」，否则会误以为自己插得很活跃
     if ((who || '') !== BOT_NAME) {
       st.lastMsgAt = Date.now();  // 群里最后一次有人说话（判断「有没有冷场」用，和 bot 说话的 lastAt 分开）
-      st.speakers.push({ who: who || '有人', at: Date.now() });
-      const win = (groupAuto.hotWindowSec ?? 60) * 1000;
-      st.speakers = st.speakers.filter((s) => Date.now() - s.at < win).slice(-40);
+      heat.add(st, who || '有人', st.lastMsgAt);
       // 插过一次话之后别人紧接着继续聊，仍算「我在连着插」；隔久了（默认 20 秒）才算新一轮
       const gap = Date.now() - st.lastAt;
       if (gap > (groupAuto.streakResetSec ?? 20) * 1000) st.botStreak = 0;
     }
   }
 
-  /** 群里的热闹程度：最近 hotWindowSec 内有多少人、多少条 */
+  /** 群里的热闹程度：最近 hotWindowSec 内有多少人、多少条（窗口内每分钟一个桶，更新 O(1)，查询 O(窗口分钟数)） */
   function groupHeat(st) {
-    const win = (groupAuto.hotWindowSec ?? 60) * 1000;
-    const now = Date.now();
-    const fresh = st.speakers.filter((s) => now - s.at < win);
-    const people = new Set(fresh.map((s) => s.who));
-    return { people: people.size, messages: fresh.length };
+    return heat.query(st, Date.now(), (groupAuto.hotWindowSec ?? 60) * 1000);
   }
 
   /** 群聊被动接话的分层：热闹时让位、冷场才补话、被叫到才直答
@@ -348,17 +425,17 @@ function createResponder({
   function groupBudget(groupId) {
     const st = gstate(groupId);
     const now = Date.now();
-    st.stamps = st.stamps.filter((t) => now - t < 3600 * 1000);
+    pruneStamps(st, now, 3600 * 1000);
     if (st.stamps.length >= groupAuto.maxPerHour) return 'group-hourly-cap';
 
     // 发言节奏自适应（2026-10-28）：群里越热闹，她越该少说话——一是别刷屏，二是
     // 小号被风控盯过（3 轮实名），发言越密越容易被当成机器人。
     if (groupAuto.adaptiveRate !== false) {
-      const heat = groupHeat(st);
+      const h = groupHeat(st);
       const hotCap = Number(groupAuto.hotMaxPerHour ?? 3);
       const veryHot =
-        heat.people >= (groupAuto.hotMinSpeakers ?? 2) + 1 &&
-        heat.messages >= (groupAuto.hotMinMessages ?? 3) * 2;
+        h.people >= (groupAuto.hotMinSpeakers ?? 2) + 1 &&
+        h.messages >= (groupAuto.hotMinMessages ?? 3) * 2;
       if (veryHot && st.stamps.length >= hotCap) return 'group-hot-cap';
     }
 
@@ -366,11 +443,11 @@ function createResponder({
     const cooldownMs = (groupAuto.minIntervalSec ?? 20) * 1000;
     if (since < cooldownMs) {
       // 群里正聊得热闹时，允许提前插一句（真人也是这么插话的）
-      const heat = groupHeat(st);
+      const h = groupHeat(st);
       const hot =
         groupAuto.hotBypass !== false &&
-        heat.people >= (groupAuto.hotMinSpeakers ?? 2) &&
-        heat.messages >= (groupAuto.hotMinMessages ?? 3);
+        h.people >= (groupAuto.hotMinSpeakers ?? 2) &&
+        h.messages >= (groupAuto.hotMinMessages ?? 3);
       if (!hot) return 'group-cooldown';
     }
 
@@ -389,8 +466,8 @@ function createResponder({
       const silent = now - st.lastMsgAt;
       // 别人刚说完（比如正在一来一回地聊），这时候插嘴就是硬凑
       if (silent < quietMs) {
-        const heat = groupHeat(st);
-        return { ok: false, reason: 'group-busy', silent, people: heat.people, messages: heat.messages };
+        const h = groupHeat(st);
+        return { ok: false, reason: 'group-busy', silent, people: h.people, messages: h.messages };
       }
     }
     return { ok: true };
@@ -399,7 +476,8 @@ function createResponder({
   function markSpoke(groupId) {
     const st = gstate(groupId);
     st.lastAt = Date.now();
-    st.stamps.push(st.lastAt);
+    st.stampAt = st.lastAt;
+    pushBounded(st.stamps, st.stampAt, HOUR_RING_CAP);
     st.botStreak += 1;
   }
 
@@ -1199,10 +1277,10 @@ function createResponder({
 
         const budgetReason = groupBudget(msg.groupId);
         if (budgetReason) {
-          const heat = groupHeat(gstate(msg.groupId));
+          const h = groupHeat(gstate(msg.groupId));
           const win = groupAuto.hotWindowSec ?? 60;
           log?.info(
-            `[群里] 这次先不插话（${budgetReason}）· 近 ${win}s 有 ${heat.people} 人说了 ${heat.messages} 句`,
+            `[群里] 这次先不插话（${budgetReason}）· 近 ${win}s 有 ${h.people} 人说了 ${h.messages} 句`,
           );
           return { skipped: budgetReason };
         }
