@@ -1,0 +1,213 @@
+{
+  "_说明": "配置模板。用法：复制成 config.json 再填 qq.appId / qq.clientSecret（或双击「填配置.cmd」）。",
+  "qq": {
+    "appId": "你的机器人AppID",
+    "clientSecret": "你的机器人AppSecret",
+    "allowFrom": [],
+    "allowGroups": [],
+    "replyInGroup": true,
+    "maxReplyChars": 1500,
+    "groupAuto": {
+      "enabled": true,
+      "mode": "keywords",
+      "keywords": [
+        "水鸡",
+        "肥鱼"
+      ],
+      "minIntervalSec": 120,
+      "maxPerHour": 12,
+      "contextSize": 8,
+      "maxConsecutive": 2,
+      "hotWindowSec": 60,
+      "hotMinSpeakers": 2,
+      "hotMinMessages": 3,
+      "hotBypass": false,
+      "reactWithSticker": true,
+      "reactMinIntervalSec": 300,
+      "staleSkipMs": 7000
+    },
+    "botNames": [
+      "水鸡",
+      "肥鱼"
+    ],
+    "groupLog": {
+      "enabled": true,
+      "injectInPrivate": false,
+      "hours": 8,
+      "perGroup": 6,
+      "maxGroups": 4,
+      "maxLines": 200,
+      "maxChars": 120
+    },
+    "ownerIds": [
+      "你的openid（私聊日志里那串 A96C…）"
+    ],
+    "ownerNames": [
+      "你的群昵称"
+    ],
+    "ownerLearn": true,
+    "ownerAlwaysReply": false,
+    "groupScope": {
+      "enabled": true,
+      "minAtEvents": 2,
+      "maxHints": 3,
+      "hintCooldownHours": 24
+    },
+    "groupNames": {
+      "群1": "群名一",
+      "群2": "群名二"
+    },
+    "groupNameLearning": true,
+    "hostile": {
+      "enabled": true,
+      "extraWords": [],
+      "bypassCooldown": true
+    },
+    "vision": {
+      "enabled": true,
+      "maxImages": 2,
+      "maxBytes": 5242880,
+      "cacheMinutes": 10,
+      "privateOnly": false,
+      "groupOnlyWhenCalled": true
+    },
+    "search": {
+      "enabled": true,
+      "maxResults": 3,
+      "snippetChars": 180,
+      "cacheMinutes": 30,
+      "dailyPerUser": 30,
+      "minIntervalMs": 15000,
+      "groupOnlyWhenCalled": true
+    },
+    "ownerQq": [
+      "你的QQ号"
+    ],
+    "ownerAliases": [
+      "你的昵称特征1",
+      "你的昵称特征2"
+    ],
+    "poke": {
+      "enabled": true,
+      "pokeBack": true,
+      "minIntervalSec": 5,
+      "useModel": false,
+      "replyTexts": [],
+      "replyWithSticker": false,
+      "typingFallback": true
+    },
+    "debugEvents": false
+  },
+  "brain": {
+    "provider": "deepseek",
+    "apiKey": "",
+    "baseURL": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "temperature": 1.3,
+    "maxTokens": 200,
+    "timeoutMs": 60000,
+    "thinking": "disabled",
+    "groupMaxTokens": 80,
+    "groupTimeoutMs": 9000,
+    "groupTemperature": 0.8
+  },
+  "memory": {
+    "enabled": true,
+    "maxTurns": 16,
+    "maxChars": 8000,
+    "autoNotes": true
+  },
+  "rhythm": {
+    "enabled": true,
+    "readDelayMinMs": 400,
+    "readDelayMaxMs": 1600,
+    "charMs": 45,
+    "typingMaxMs": 3500,
+    "bubbleGapMinMs": 350,
+    "bubbleGapMaxMs": 1400,
+    "maxBubbles": 3,
+    "maxCharsPerBubble": 50,
+    "minCharsPerBubble": 3,
+    "mergeBurst": true,
+    "mergeWindowMs": 700,
+    "mergeMaxWaitMs": 3000
+  },
+  "sticker": {
+    "enabled": true,
+    "minGapMs": 30000,
+    "catalogFile": "stickers.json",
+    "folder": "表情包",
+    "learn": {
+      "enabled": true,
+      "maxBytes": 4194304,
+      "maxCount": 80,
+      "maxPerMessage": 2
+    }
+  },
+  "style": {
+    "enabled": true,
+    "maxSamples": 3,
+    "samplePool": 10,
+    "minCount": 3,
+    "corpusPath": "",
+    "minCorpus": 8,
+    "learnPath": "",
+    "negativePath": "",
+    "learnMax": 2000,
+    "group": true
+  },
+  "log": {
+    "level": "info",
+    "toFile": true
+  },
+  "modes": {
+    "enabled": true,
+    "silentCommands": [
+      "潜水",
+      "进入潜水",
+      "开始潜水",
+      "安静点",
+      "静音"
+    ],
+    "wakeCommands": [
+      "浮上来",
+      "出来",
+      "醒醒",
+      "别潜水了",
+      "恢复"
+    ],
+    "summaryCommands": [
+      "潜水总结",
+      "总结一下",
+      "群里都聊啥了"
+    ],
+    "summarizeOnWake": false,
+    "summaryHours": 12,
+    "summaryMaxGroups": 4,
+    "summarize": false
+  },
+  "proactive": {
+    "enabled": false,
+    "channel": "auto",
+    "tickMinutes": 10,
+    "maxPerDay": 2,
+    "minGapHoursPerUser": 72,
+    "idleHours": 6,
+    "lookbackDays": 30,
+    "minUserTurns": 3,
+    "topicFrom": 7,
+    "quietHours": [
+      23,
+      8
+    ],
+    "maxCandidates": 5,
+    "onlyOwner": false,
+    "wakeupLimitPer30d": 4
+  },
+  "onebot": {
+    "enabled": true,
+    "url": "ws://127.0.0.1:3001",
+    "accessToken": "",
+    "selfId": 0
+  }
+}

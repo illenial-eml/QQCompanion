@@ -1,0 +1,32 @@
+{
+  "_说明": "表情包索引示例。真实使用时把图片放到表情包/ 目录、名字作为 key 即可。",
+  "stickers": [
+    {
+      "name": "开心",
+      "tags": [
+        "happy"
+      ],
+      "file": "assets/stickers/happy.gif",
+      "pack": "builtin",
+      "packName": "内置"
+    },
+    {
+      "name": "无语",
+      "tags": [
+        "speechless"
+      ],
+      "file": "assets/stickers/speechless.gif",
+      "pack": "builtin",
+      "packName": "内置"
+    },
+    {
+      "name": "睡觉",
+      "tags": [
+        "sleep"
+      ],
+      "file": "assets/stickers/sleep.gif",
+      "pack": "builtin",
+      "packName": "内置"
+    }
+  ]
+}
