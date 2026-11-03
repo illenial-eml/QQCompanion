@@ -118,14 +118,30 @@ function tokenize(s) {
   return out;
 }
 
-/** BM25 打分（k1=1.2, b=0.75） */
+/**
+ * BM25 打分（k1=1.2, b=0.75）+ 倒排索引
+ *
+ * 建索引时同时记下两张表：
+ *   postings: 词项 -> 含有该词项的文档下标集合（倒排索引）
+ *   df:       词项 -> 文档频率（算 idf 用）
+ *
+ * 查询时只遍历「查询词命中的候选文档」，而不是遍历整库：
+ *   候选数 |C| 通常远小于总文档数 N，从 O(N·|q|) 降到 O(|C|·|q|)。
+ * 这是把「只对命中文档算分」从说法变成代码的关键一步。
+ */
 function createIndex(docs) {
   const df = new Map();
-  const items = docs.map((d) => {
+  const postings = new Map();
+  const items = docs.map((d, di) => {
     const toks = tokenize(`${d.title}\n${d.text}`);
     const tf = new Map();
     for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
-    for (const t of tf.keys()) df.set(t, (df.get(t) || 0) + 1);
+    for (const t of tf.keys()) {
+      df.set(t, (df.get(t) || 0) + 1);
+      let posting = postings.get(t);
+      if (!posting) { posting = new Set(); postings.set(t, posting); }
+      posting.add(di);
+    }
     return { ...d, tf, len: toks.length };
   });
   const avgLen = items.reduce((a, b) => a + b.len, 0) / Math.max(1, items.length);
@@ -137,8 +153,20 @@ function createIndex(docs) {
     const qToks = tokenize(query);
     if (!qToks.length || !N) return [];
     const qSet = [...new Set(qToks)];
+
+    // ① 取并集得到候选文档（只碰这些文档的 tf）
+    const candidates = new Set();
+    for (const t of qSet) {
+      const posting = postings.get(t);
+      if (!posting) continue;
+      for (const di of posting) candidates.add(di);
+    }
+    if (!candidates.size) return [];
+
+    // ② 只对候选文档打分
     const scored = [];
-    for (const it of items) {
+    for (const di of candidates) {
+      const it = items[di];
       let score = 0;
       for (const t of qSet) {
         const f = it.tf.get(t) || 0;
@@ -153,7 +181,7 @@ function createIndex(docs) {
     return scored.slice(0, topK);
   }
 
-  return { search, size: N, avgLen };
+  return { search, size: N, avgLen, postings, df };
 }
 
 /**
