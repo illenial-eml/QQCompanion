@@ -21,9 +21,6 @@ const path = require('path');
 /** Node 24 自带标准 WebSocket，零依赖直接用（addEventListener 那套接口） */
 const WS = globalThis.WebSocket;
 
-/** msg_id 去重的容量：保留最近这么多条消息的 id（够挡住腾讯的重复推送） */
-const DEDUPE_CAPACITY = 500;
-
 const ONEBOT_DEFAULTS = {
   enabled: true,
   url: 'ws://127.0.0.1:3001',   // NapCat 的「WebSocket 服务器」地址
@@ -134,7 +131,7 @@ class OneBotClient extends EventEmitter {
     this._closedByUser = false;
     this._reconnectTimer = null;
     this._dedupe = new Set();
-    this._dedupeRing = null;   // {buf, head, len} —— 定长环形缓冲，见 _isDuplicate()
+    this._dedupeOrder = [];
   }
 
   // ================= 连接 =================
@@ -391,40 +388,33 @@ class OneBotClient extends EventEmitter {
     this.log?.debug?.('notice:', ev.notice_type, ev.sub_type || '');
   }
 
-  /**
-   * msg_id 去重：定长环形缓冲 + 集合双写
-   *
-   * 老写法用 `_dedupeOrder.shift()` 淘汰最旧的，而 shift 要把后面所有元素前移，
-   * 单次 O(n)。这里用「固定容量数组 + 头指针 + 长度」的环形缓冲，
-   * 满了就覆盖最旧的那个位置：写入 O(1)，不需要搬数据。
-   */
   _isDuplicate(id) {
     const key = String(id || '');
     if (!key) return false;
     if (this._dedupe.has(key)) return true;
     this._dedupe.add(key);
-
-    const cap = DEDUPE_CAPACITY;
-    if (!this._dedupeRing) this._dedupeRing = { buf: new Array(cap), head: 0, len: 0 };
-    const ring = this._dedupeRing;
-    if (ring.len < cap) {
-      ring.buf[(ring.head + ring.len) % cap] = key;
-      ring.len += 1;
-    } else {
-      const evicted = ring.buf[ring.head];
-      ring.buf[ring.head] = key;
-      ring.head = (ring.head + 1) % cap;
-      if (evicted !== undefined) this._dedupe.delete(evicted);
+    this._dedupeOrder.push(key);
+    if (this._dedupeOrder.length > 500) {
+      const old = this._dedupeOrder.shift();
+      this._dedupe.delete(old);
     }
     return false;
   }
 
   // ================= 发送（签名故意和 QQBotClient 对齐） =================
 
-  /** 组 message 段：文字 + 引用 + 图片 */
-  _buildMessage(content, { msgId, quote } = {}) {
+  /**
+   * 组 message 段：引用 + @人 + 文字
+   * @ 段必须是独立的一段（{type:'at'}），和文字混在一起 QQ 不会渲染成蓝色@
+   */
+  _buildMessage(content, { msgId, quote, at } = {}) {
     const segs = [];
     if (msgId && quote !== false) segs.push({ type: 'reply', data: { id: String(msgId) } });
+    const ats = Array.isArray(at) ? at : at ? [at] : [];
+    for (const qq of ats) {
+      const id = String(qq || '').trim();
+      if (/^\d{3,}$/.test(id)) segs.push({ type: 'at', data: { qq: id } });
+    }
     if (content) segs.push({ type: 'text', data: { text: String(content) } });
     return segs;
   }
@@ -444,11 +434,23 @@ class OneBotClient extends EventEmitter {
     });
   }
 
-  sendGroup(groupId, content, { msgId } = {}) {
+  sendGroup(groupId, content, { msgId, at } = {}) {
     const quote = this._quoteMode() !== 'none';
     return this.api('send_group_msg', {
       group_id: Number(groupId),
-      message: this._buildMessage(content, { msgId, quote }),
+      message: this._buildMessage(content, { msgId, quote, at }),
+    });
+  }
+
+  /**
+   * 在群里 @ 某个人再说一句话。
+   * 主人下命令「@张三 说：晚上开会」时走这条路。
+   */
+  sendGroupAt(groupId, atUserIds, content = '', { msgId } = {}) {
+    const quote = this._quoteMode() === 'all';
+    return this.api('send_group_msg', {
+      group_id: Number(groupId),
+      message: this._buildMessage(content, { msgId, quote, at: atUserIds }),
     });
   }
 
@@ -468,6 +470,18 @@ class OneBotClient extends EventEmitter {
     const action = scene === 'group' ? 'send_group_msg' : 'send_private_msg';
     const params = scene === 'group' ? { group_id: Number(groupId), message: segs } : { user_id: Number(userId), message: segs };
     return this.api(action, params);
+  }
+
+  /** 小号当前所在的群列表（缓存 5 分钟；主人私聊「在群里@人」时要用它找群） */
+  async getGroupList({ force = false } = {}) {
+    const TTL = 5 * 60 * 1000;
+    const now = Date.now();
+    if (!force && this._groupsCache && now - (this._groupsCacheAt || 0) < TTL) return this._groupsCache;
+    const data = await this.api('get_group_list', {});
+    const list = Array.isArray(data) ? data : [];
+    this._groupsCache = list;
+    this._groupsCacheAt = now;
+    return list;
   }
 
   /** 真·戳一戳：NapCat 支持 */

@@ -16,33 +16,12 @@ const { detectHostile } = require('./hostile');
 const { parseReminder, fmt, fmtIn, isReminderRequest } = require('./reminders');
 const { looksForOwner, looksStuck } = require('./notify-owner');
 const { matchHandoverCommand } = require('./handover');
+const { isClosing, closingReply } = require('./silence');
 
 const PASSIVE_LIMIT = { c2c: 4, group: 5 };
 
-/** 热度分桶：桶跨度 1 分钟；两个桶时间差不超过这么多分钟就当作「连续的桶」 */
-const HEAT_KEEP_MIN = 1;
-
-/** 「一小时发了多少次」用定长环形缓冲：容量 = 每小时上限，满了就覆盖最旧的（O(1)） */
-const HOUR_RING_CAP = 200;
-
-/**
- * 定长环形缓冲写入：满了就覆盖最旧的，不搬数据。
- * 用于「最近一小时发言时间戳」这种只看固定上限的记录。
- */
-function pushBounded(arr, value, cap) {
-  arr.push(value);
-  if (arr.length > cap) arr.splice(0, arr.length - cap);
-  return arr;
-}
-
-/** 丢掉超出窗口的时间戳（只可能发生在最前面，所以是 O(被丢掉的条数)） */
-function pruneStamps(st, nowMs, winMs) {
-  const stamps = st.stamps;
-  let i = 0;
-  while (i < stamps.length && nowMs - stamps[i] >= winMs) i += 1;
-  if (i > 0) stamps.splice(0, i);
-  return stamps;
-}
+/** 私聊里她上次回「晚安/拜拜」的时间：5 分钟内再收到收尾话，就真的不回了 */
+const closingSeen = new Map();
 
 /** 群里记忆里记自己说的话时用的名字（一般和 QQ 里显示的机器人名一致） */
 const BOT_NAME = '小D';
@@ -196,11 +175,19 @@ function isTrivialChatter(text) {
  */
 function normalizeReply(text) {
   let t = String(text || '');
+  // 模型会把历史消息里的日期标注抄到自己话的前面（「[11月4日] 嗯」），发出去很怪，去掉
+  t = t.replace(/^[ \t]*[\[【（(]\s*\d{1,2}\s*月\s*\d{1,2}\s*[日号]?\s*(?:周[一二三四五六日天])?\s*[\]】）)][ \t]*/gm, '');
+  // 不加括号的「11月4日 嗯」也去掉；但如果整条回复就是一个日期（他在问今天几号），保留
+  t = t.replace(/^[ \t]*\d{1,2}\s*月\s*\d{1,2}\s*[日号]\s*[，,：:\-—]?[ \t]*/gm, (m, off, s) => {
+    const rest = s.slice(off + m.length);
+    return rest.replace(/\s/g, '').length >= 2 ? '' : m;
+  });
   t = t.replace(/(\d)\s*([:：])\s*(\d)/g, '$1:$3');   // 10 : 30 -> 10:30
-  t = t.replace(/(\d)\s+(?=\d)/g, '$1');              // 10:3 0 -> 10:30
-  t = t.replace(/([\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])/g, '$1'); // 中文之间不留空格
-  t = t.replace(/([\u4e00-\u9fa5])\s+(?=[0-9])/g, '$1');           // 中文和数字之间不留空格
-  t = t.replace(/([0-9])\s+(?=[\u4e00-\u9fa5])/g, '$1');           // 数字和中文之间不留空格
+  t = t.replace(/(\d)[ \t]+(?=\d)/g, '$1');            // 10:3 0 -> 10:30
+  // 只收拾空格，不动换行（换行是她分段用的，删了会把好几句话粘成一行）
+  t = t.replace(/([\u4e00-\u9fa5])[ \t]+(?=[\u4e00-\u9fa5])/g, '$1'); // 中文之间不留空格
+  t = t.replace(/([\u4e00-\u9fa5])[ \t]+(?=[0-9])/g, '$1');           // 中文和数字之间不留空格
+  t = t.replace(/([0-9])[ \t]+(?=[\u4e00-\u9fa5])/g, '$1');           // 数字和中文之间不留空格
   // 半角标点转全角（只在挨着中文时才转，避免破坏 10:30、1,000 这种）
   const CN = /[\u4e00-\u9fa5]/;
   const HALF2FULL = { ',': '，', ';': '；', ':': '：', '!': '！', '?': '？' };
@@ -298,6 +285,9 @@ function createResponder({
   reminderStore = null,                 // 日程提醒（只认主人的私聊）
   notifySvc = null,                     // 「有人找你」：别人找主人 / 她答不上来 → 私信提醒主人上号
   emojiLiker = null,                    // 贴表情（NapCat 的 set_msg_emoji_like）
+  innerLife = null,                     // 内心深处（未完话头 / 重要日子 / 他最近怎么样）
+  crossWindow = null,                   // 跨窗口连续性（群里说过的话，私聊 30 分钟内还接得上）
+  biliBrowser = null,                   // 她自己刷 B 站：私聊里带上「刚刷到的」
 }) {
   const groupAuto = { ...GROUP_AUTO_DEFAULTS, ...(cfg.qq.groupAuto || {}) };
   const groupAnswer = { ...GROUP_ANSWER_DEFAULTS, ...(cfg.qq.groupAnswer || {}) };
@@ -305,62 +295,7 @@ function createResponder({
   const rhythm = { ...RHYTHM_DEFAULTS, ...(cfg.rhythm || {}) };
   const stickerList = stickers?.list || [];
   const stickerSvc = stickers?.service || null;
-  const groups = new Map(); // groupId -> { lines, lastAt, stamps, buckets, botStreak }
-
-  /**
-   * 群热度：按分钟分桶 + 滑动窗口（把「按分钟分桶 + 滑动窗口」从说法变成代码）
-   *
-   * 老写法每来一条消息、每次判断都要对整条说话记录做 filter：
-   *   st.speakers = st.speakers.filter(...)   // 每次 O(n)
-   * 现在改成：
-   *   - 每条消息只往「当前这一分钟」的桶里 +1          → 更新 O(1)
-   *   - 查询时只看窗口覆盖的那几个桶再把它们加起来      → O(窗口分钟数)，与历史条数无关
-   * 连续发很多条消息，历史记录也不会无限变长（只保留窗口 + 1 分钟）。
-   */
-  const heat = {
-    add(st, who, at) {
-      const mi = Math.floor(at / 60000);
-      const last = st.buckets[st.buckets.length - 1];
-      let b;
-      if (last && mi - last.t <= HEAT_KEEP_MIN) {
-        // 同一个桶（或者中间空了几分钟）就往前推：把空出来的分钟补成空桶，保持下标可算
-        while (last.t < mi) {
-          last.t += 1;
-          st.buckets.push({ t: last.t, who: new Map(), n: 0 });
-        }
-        b = st.buckets[st.buckets.length - 1];
-      } else {
-        // 隔太久了，旧桶全没用，直接重建
-        st.buckets = [{ t: mi, who: new Map(), n: 0 }];
-        b = st.buckets[0];
-      }
-      b.who.set(who, (b.who.get(who) || 0) + 1);
-      b.n += 1;
-      st.bucketAt = at;
-      // 只留窗口内的桶，别让数组无限长
-      const keepMs = (groupAuto.hotWindowSec ?? 60) * 1000;
-      const cutoff = mi - Math.ceil(keepMs / 60000) - 1;
-      while (st.buckets.length && st.buckets[0].t < cutoff) st.buckets.shift();
-      return b;
-    },
-    query(st, nowMs, winMs) {
-      if (!st.buckets.length) return { people: 0, messages: 0 };
-      // 这条消息如果是「上一分钟」的，now 可能略微落后于它；用两者较大的那个
-      const now = Math.max(nowMs, st.bucketAt);
-      const from = Math.floor((now - winMs) / 60000);
-      const to = Math.floor(now / 60000);
-      const who = new Map();
-      let n = 0;
-      for (let i = st.buckets.length - 1; i >= 0; i -= 1) {
-        const b = st.buckets[i];
-        if (b.t > to) continue;
-        if (b.t < from) break;
-        n += b.n;
-        for (const [w, c] of b.who) who.set(w, (who.get(w) || 0) + c);
-      }
-      return { people: who.size, messages: n };
-    },
-  };
+  const groups = new Map(); // groupId -> { lines, lastAt, stamps, speakers, botStreak }
   // 连着几条没发表情了就提醒模型一句（表情包要「用起来」，不然存着也是白存）
   let repliesSinceSticker = 0;
 
@@ -368,10 +303,7 @@ function createResponder({
     let st = groups.get(groupId);
     if (!st) {
       st = {
-        lines: [], lastAt: 0, stamps: [], botStreak: 0, lastReactAt: 0,
-        buckets: [],       // 热度分桶：每项 { t: 分钟序号, who: Map<名字, 条数>, n: 条数 }
-        bucketAt: 0,       // buckets 里最新一桶的绝对时间（0 = 还没有）
-        stampAt: 0,        // stamps 里最新一次发言的时间（环形缓冲用）
+        lines: [], lastAt: 0, stamps: [], speakers: [], botStreak: 0, lastReactAt: 0,
         pending: null,     // 群里待解决的一个问题（谁问的、问的什么、几个人回过）
         answerStamps: [],  // 主动答题的时间戳（每小时的额度）
         botLines: [],      // 自己最近说过的话（挡重复）
@@ -405,16 +337,22 @@ function createResponder({
     // 注意：自己说的话不算「热闹」，否则会误以为自己插得很活跃
     if ((who || '') !== BOT_NAME) {
       st.lastMsgAt = Date.now();  // 群里最后一次有人说话（判断「有没有冷场」用，和 bot 说话的 lastAt 分开）
-      heat.add(st, who || '有人', st.lastMsgAt);
+      st.speakers.push({ who: who || '有人', at: Date.now() });
+      const win = (groupAuto.hotWindowSec ?? 60) * 1000;
+      st.speakers = st.speakers.filter((s) => Date.now() - s.at < win).slice(-40);
       // 插过一次话之后别人紧接着继续聊，仍算「我在连着插」；隔久了（默认 20 秒）才算新一轮
       const gap = Date.now() - st.lastAt;
       if (gap > (groupAuto.streakResetSec ?? 20) * 1000) st.botStreak = 0;
     }
   }
 
-  /** 群里的热闹程度：最近 hotWindowSec 内有多少人、多少条（窗口内每分钟一个桶，更新 O(1)，查询 O(窗口分钟数)） */
+  /** 群里的热闹程度：最近 hotWindowSec 内有多少人、多少条 */
   function groupHeat(st) {
-    return heat.query(st, Date.now(), (groupAuto.hotWindowSec ?? 60) * 1000);
+    const win = (groupAuto.hotWindowSec ?? 60) * 1000;
+    const now = Date.now();
+    const fresh = st.speakers.filter((s) => now - s.at < win);
+    const people = new Set(fresh.map((s) => s.who));
+    return { people: people.size, messages: fresh.length };
   }
 
   /** 群聊被动接话的分层：热闹时让位、冷场才补话、被叫到才直答
@@ -425,17 +363,17 @@ function createResponder({
   function groupBudget(groupId) {
     const st = gstate(groupId);
     const now = Date.now();
-    pruneStamps(st, now, 3600 * 1000);
+    st.stamps = st.stamps.filter((t) => now - t < 3600 * 1000);
     if (st.stamps.length >= groupAuto.maxPerHour) return 'group-hourly-cap';
 
     // 发言节奏自适应（2026-10-28）：群里越热闹，她越该少说话——一是别刷屏，二是
     // 小号被风控盯过（3 轮实名），发言越密越容易被当成机器人。
     if (groupAuto.adaptiveRate !== false) {
-      const h = groupHeat(st);
+      const heat = groupHeat(st);
       const hotCap = Number(groupAuto.hotMaxPerHour ?? 3);
       const veryHot =
-        h.people >= (groupAuto.hotMinSpeakers ?? 2) + 1 &&
-        h.messages >= (groupAuto.hotMinMessages ?? 3) * 2;
+        heat.people >= (groupAuto.hotMinSpeakers ?? 2) + 1 &&
+        heat.messages >= (groupAuto.hotMinMessages ?? 3) * 2;
       if (veryHot && st.stamps.length >= hotCap) return 'group-hot-cap';
     }
 
@@ -443,11 +381,11 @@ function createResponder({
     const cooldownMs = (groupAuto.minIntervalSec ?? 20) * 1000;
     if (since < cooldownMs) {
       // 群里正聊得热闹时，允许提前插一句（真人也是这么插话的）
-      const h = groupHeat(st);
+      const heat = groupHeat(st);
       const hot =
         groupAuto.hotBypass !== false &&
-        h.people >= (groupAuto.hotMinSpeakers ?? 2) &&
-        h.messages >= (groupAuto.hotMinMessages ?? 3);
+        heat.people >= (groupAuto.hotMinSpeakers ?? 2) &&
+        heat.messages >= (groupAuto.hotMinMessages ?? 3);
       if (!hot) return 'group-cooldown';
     }
 
@@ -466,8 +404,8 @@ function createResponder({
       const silent = now - st.lastMsgAt;
       // 别人刚说完（比如正在一来一回地聊），这时候插嘴就是硬凑
       if (silent < quietMs) {
-        const h = groupHeat(st);
-        return { ok: false, reason: 'group-busy', silent, people: h.people, messages: h.messages };
+        const heat = groupHeat(st);
+        return { ok: false, reason: 'group-busy', silent, people: heat.people, messages: heat.messages };
       }
     }
     return { ok: true };
@@ -476,8 +414,7 @@ function createResponder({
   function markSpoke(groupId) {
     const st = gstate(groupId);
     st.lastAt = Date.now();
-    st.stampAt = st.lastAt;
-    pushBounded(st.stamps, st.stampAt, HOUR_RING_CAP);
+    st.stamps.push(st.lastAt);
     st.botStreak += 1;
   }
 
@@ -1091,6 +1028,63 @@ function createResponder({
     const ownerAlways = fromOwner && (!isGroup || ownerStore?.settings?.alwaysReply === true);
     const mentioned = ownerAlways ? true : (isGroup ? msg.mentioned !== false : true);
 
+    // 内心深处：只有跟主人私聊才带上（话头 / 日子 / 他最近怎么样）；群里绝不带，免得把他的私事说漏
+    let innerContext = '';
+    let innerClosed = [];
+    if (innerLife && !isGroup && fromOwner && text) {
+      try {
+        const ownerRec = brain.people && brain.people.get ? brain.people.get(msg.userId) : null;
+        innerContext = innerLife.contextFor({
+          scene: msg.scene,
+          owner: true,
+          since: ownerRec && ownerRec.firstSeen ? ownerRec.firstSeen : 0,
+        });
+        // 他这句话是不是把挂着的事说完了（「考完了」「offer 拿到了」）
+        innerClosed = innerLife.noteOwnerText(text) || [];
+        if (innerClosed.length) log?.info(`内心深处：这件事有着落了 —— ${innerClosed.map((x) => x.text).join(' / ')}`);
+      } catch (e) {
+        log?.debug?.('内心深处：取上下文失败 ' + e.message);
+      }
+      // 刚才在群里说过话的话，私聊里还接得上（只在他自己的公开原话范围内）
+      if (crossWindow) {
+        try {
+          const cross = crossWindow.contextFor({ userId: msg.userId, scene: msg.scene });
+          if (cross) {
+            innerContext = innerContext ? innerContext + '\n\n' + cross : cross;
+            log?.debug?.('跨窗口：带上他刚在群里说的话');
+          }
+        } catch (e) {
+          log?.debug?.('跨窗口：取上下文失败 ' + e.message);
+        }
+      }
+      // 她自己刷的 B 站：有人问起就自然提一句（没问就不扯）
+      if (biliBrowser) {
+        try {
+          const bili = biliBrowser.contextFor({ scene: msg.scene });
+          if (bili) {
+            innerContext = innerContext ? innerContext + '\n\n' + bili : bili;
+            log?.debug?.('B站：带上她刚刷到的');
+          }
+        } catch (e) {
+          log?.debug?.('B站：取上下文失败 ' + e.message);
+        }
+      }
+    }
+
+    // 跨窗口连续性：主人在群里说的话记一份（只用他自己的公开原话，不记别人的）
+    if (isGroup && fromOwner && text && crossWindow) {
+      try {
+        crossWindow.noteGroupLine({
+          userId: msg.userId,
+          text,
+          where: groupNames && groupNames.labelOf ? groupNames.labelOf(msg.groupId) : '群里',
+          owner: true,
+        });
+      } catch (e) {
+        log?.debug?.('跨窗口：记录失败 ' + e.message);
+      }
+    }
+
     // 群里的每条消息都记进上下文（包括不回的），判断氛围要靠这个
     // （定时扫「冷场问题」时会用问题的原文再走一遍 handle，那种情况不用重复记）
     if (isGroup && !msg.__answerNow) rememberLine(msg.groupId, msg.userName, text || '(非文本消息)');
@@ -1258,6 +1252,30 @@ function createResponder({
       }
     }
 
+    // 确定性沉默：晚安/拜拜/去上课了这类收尾话不过模型（省一次调用，也更像真人）
+    if (text && !hostileNow && !answerTarget && cfg.qq.deterministicSilence?.enabled !== false) {
+      if (isClosing(text)) {
+        if (isGroup) {
+          // 群里不跟每个人道晚安；只有被点名才回
+          if (!mentioned) {
+            log?.debug?.('收尾话，群里不接：' + String(text).slice(0, 16));
+            return { skipped: 'group-closing', learned: learnedNames };
+          }
+        } else {
+          const lastAt = closingSeen.get(msg.userId) || 0;
+          const r = closingReply(text, { rng, lastReplyAt: lastAt });
+          if (!r.text) {
+            log?.info('收尾话：她刚道过别，这次不回了');
+            return { skipped: 'silence-quiet', learned: learnedNames };
+          }
+          closingSeen.set(msg.userId, Date.now());
+          await safeSend(msg, r.text, 1);
+          log?.info(`收尾话直接回：${r.text}`);
+          return { reply: r.text, skipped: 'closing-fast', learned: learnedNames };
+        }
+      }
+    }
+
     // 群聊里没 @ 我的消息：先判断要不要自己接一句
     let allowPass = false;
     if (isGroup && !mentioned && !answerTarget) {
@@ -1277,10 +1295,10 @@ function createResponder({
 
         const budgetReason = groupBudget(msg.groupId);
         if (budgetReason) {
-          const h = groupHeat(gstate(msg.groupId));
+          const heat = groupHeat(gstate(msg.groupId));
           const win = groupAuto.hotWindowSec ?? 60;
           log?.info(
-            `[群里] 这次先不插话（${budgetReason}）· 近 ${win}s 有 ${h.people} 人说了 ${h.messages} 句`,
+            `[群里] 这次先不插话（${budgetReason}）· 近 ${win}s 有 ${heat.people} 人说了 ${heat.messages} 句`,
           );
           return { skipped: budgetReason };
         }
@@ -1398,6 +1416,7 @@ function createResponder({
         images,
         searchContext,
         groupProfile: isGroup ? (cfg.qq?.groupProfiles?.[msg.groupId] || cfg.qq?.groupProfiles?.[String(msg.groupId)] || '') : '',
+        innerContext,
         answerNote: answerTarget
           ? {
             text: answerTarget.text,

@@ -131,6 +131,11 @@ function createPeopleStore({ file, cfg = {}, log = null, now = nowMs } = {}) {
         note: '',         // 她自己的印象摘要（模型偶尔更新）
         attitude: 0,      // 落盘的态度分
         summarizedTurns: 0,
+        birthday: '',   // 生日 MM-DD（他自己说过 / 主人主动告诉）
+        likes: [],      // 爱吃/喜欢的（最多 6 条）
+        avoid: [],      // 不吃/讨厌的（最多 6 条）
+        callMe: '',     // 他管她叫什么
+        howWeMet: '',   // 怎么认识的
       };
       state.people[id] = p;
     }
@@ -208,6 +213,27 @@ function createPeopleStore({ file, cfg = {}, log = null, now = nowMs } = {}) {
     return true;
   }
 
+  /**
+   * 关系卡：生日 / 喜欢什么 / 不吃什么 / 他怎么称呼她 / 怎么认识的。
+   * 主人一句话就能改，夜间反思也可以补，但都要走这里，保证落盘。
+   */
+  function setProfile(userId, patch = {}) {
+    if (conf.enabled === false) return false;
+    const p = ensure(userId);
+    if (!p) return false;
+    const clipList = (arr, max = 6) => {
+      const set = new Set((arr || []).map((x) => String(x || "").trim()).filter((x) => x && x.length <= 20));
+      return [...set].slice(-max);
+    };
+    if (typeof patch.birthday === 'string' && /^\d{1,2}-\d{1,2}$/.test(patch.birthday.trim())) p.birthday = patch.birthday.trim();
+    if (Array.isArray(patch.likes)) p.likes = clipList([...(p.likes || []), ...patch.likes]);
+    if (Array.isArray(patch.avoid)) p.avoid = clipList([...(p.avoid || []), ...patch.avoid]);
+    if (typeof patch.callMe === 'string') p.callMe = String(patch.callMe).trim().slice(0, 12);
+    if (typeof patch.howWeMet === 'string') p.howWeMet = String(patch.howWeMet).trim().slice(0, 40);
+    save();
+    return true;
+  }
+
   /** 超出上限时，把最久没聊、话最少的挪出去 */
   function trimPeople() {
     const list = Object.values(state.people);
@@ -225,6 +251,13 @@ function createPeopleStore({ file, cfg = {}, log = null, now = nowMs } = {}) {
     const a = attitudeFor(p.attitude);
     const lines = [];
     lines.push(`## 你對这个人（${p.name || '对方'}）的印象`);
+    // 关系卡是主人明确告诉过你的事，跟聊过几句无关，新认识也要带着
+    const card = [];
+    if (p.birthday) card.push(`· 他的生日：${p.birthday}（到这个日子你自己心里有数就行，别念出来）。`);
+    if (p.likes && p.likes.length) card.push(`· 他喜欢/爱吃的：${p.likes.join('、')}`);
+    if (p.avoid && p.avoid.length) card.push(`· 他不吃/讨厌的：${p.avoid.join('、')}（别给他推荐这些）`);
+    if (p.callMe) card.push(`· 他管你叫「${p.callMe}」`);
+    if (p.howWeMet) card.push(`· 你们怎么认识的：${p.howWeMet}`);
     if (p.turns <= 1) {
       lines.push('· 你们刚认识，你对他没什么印象。');
     } else {
@@ -238,6 +271,7 @@ function createPeopleStore({ file, cfg = {}, log = null, now = nowMs } = {}) {
       lines.push(`· 你现在的态度：${a.label}（${a.tone}）。`);
       if (p.rudeHits > 0) lines.push('· 他之前说过难听的话，不用对他太客气，但也别主动找茬。');
     }
+    if (card.length) lines.push(...card);
     return lines.join('\n');
   }
 
@@ -271,6 +305,10 @@ function createPeopleStore({ file, cfg = {}, log = null, now = nowMs } = {}) {
         `· 我对他的印象：${p.note || '（还说不清）'}`,
         `· 我的态度：${a.label}`,
       ];
+      if (p.birthday) out.push(`· 他的生日：${p.birthday}`);
+      if (p.likes && p.likes.length) out.push(`· 他喜欢：${p.likes.join('、')}`);
+      if (p.avoid && p.avoid.length) out.push(`· 他不喜欢：${p.avoid.join('、')}`);
+      if (p.callMe) out.push(`· 他管你叫：${p.callMe}`);
       if (p.recent && p.recent.length) {
         out.push('· 最近说过的话：');
         for (const r of p.recent) out.push(`   - ${r.text}`);
@@ -288,7 +326,7 @@ function createPeopleStore({ file, cfg = {}, log = null, now = nowMs } = {}) {
   }
 
   return {
-    load, save, get, ensure, observe, setNote, setAliases, find, contextFor, rosterFor, view,
+    load, save, get, ensure, observe, setNote, setAliases, setProfile, find, contextFor, rosterFor, view,
     settings: conf,
     state: () => state,
   };

@@ -276,7 +276,7 @@ class Brain {
     }
   }
 
-  systemPrompt(mem, { scene = 'c2c', groupContext = '', allowPass = false, stickerNudge = false, fromOwner = false, speaker = '', scopeHints = [], hostile = [], imageCount = 0, searchContext = '', knowledgeHits = [], longtermItems = [], groupProfile = '', peopleContext = '' } = {}) {
+  systemPrompt(mem, { scene = 'c2c', groupContext = '', allowPass = false, stickerNudge = false, fromOwner = false, speaker = '', scopeHints = [], hostile = [], imageCount = 0, searchContext = '', knowledgeHits = [], longtermItems = [], groupProfile = '', peopleContext = '', innerContext = '' } = {}) {
     // 顺序很关键：前面这段几乎不变，DeepSeek 按「前缀」命中缓存，缓存命中的 token 只要十分之一价钱。
     // 所以固定的（人设 + 输出要求 + 表情规则 + 场景规则）放最前，会变的（时间、记忆、语气样本、群聊上下文）放最后。
     const stable = [this.persona.trim()];
@@ -288,6 +288,7 @@ class Brain {
     stable.push(
       '\n## 输出要求\n' +
       '直接输出你要发的话本身：不加「小D：」之类前缀、不加引号、不解释你在做什么。' +
+      '历史里那些「[11月4日]」是系统标注的时间，**你回话时绝对不要带日期、不要带方括号**。' +
       lengthRule +
       '不要写成整齐的一大段，不要分点，不要总结。\n' +
       '标点要正常：一句话说完用句号/问号/感叹号收掉，一个气泡里说几件事就用逗号隔开，' +
@@ -384,6 +385,23 @@ class Brain {
     if (this.selfState) {
       const desc = this.selfState.describe();
       if (desc) volatile.push(`\n## 你现在的状态\n${desc}`);
+      // 情绪要落在语气和小动作上，不要直接播报「我很开心」
+      volatile.push(
+        '\n## 情绪怎么表达\n' +
+        '- 上面那行「你现在的状态」是真的：心情会渗到你说话的口气里（累就短、烦就冲、心里软就多说半句）。\n' +
+        '- 但**不要**直接说出来：「我现在心情不错」「我有点难过」这种一句都不许有，让人从你怎么说话里听出来。\n' +
+        '- 情绪偶尔可以带一点小动作或语气（「嗯…」「啧」「唉」），但别表演、别夸张。\n'
+      );
+    }
+
+    // 她自己的日子：不只是在等他，也有自己的事在做
+    if (this.life) {
+      try {
+        const lifeText = this.life.contextForPrompt();
+        if (lifeText) volatile.push(lifeText);
+      } catch {
+        /* 读失败就当没有 */
+      }
     }
 
     // 自我认知：她自己攒的想法和说话习惯（会慢慢变，不是写死的设定）
@@ -411,6 +429,12 @@ class Brain {
             '\n（这些是长期记住的：聊天里的细节可以忘，这些别忘。聊到相关的事自然带上，别生硬地背。）'
         );
       }
+    }
+
+    // 内心深处（innerlife）：还没完的事 / 重要的日子 / 他最近怎么样
+    // 只在跟主人私聊时由调用方传进来；这里只管贴，不做判断。
+    if (innerContext && String(innerContext).trim()) {
+      volatile.push('\n' + String(innerContext).trim());
     }
 
     // 知识库：这次的问题查到了资料就把资料贴进来（带出处，方便她说「我记得看过」）
@@ -514,12 +538,14 @@ class Brain {
     // 有人带脏字冲它来：回嘴，不讲道理
     if (hostile && hostile.length) {
       volatile.push(
-        '\n## 有人在骂你\n' +
+        '\n## 有人在骂你（这条只干一件事：骂回去）\n' +
         `对方用了这些词：${hostile.slice(0, 3).map((w) => `「${w}」`).join('、')}\n` +
-        '- 别讲道理、别礼貌、别说「冷静点」「我不接受这种话」，也别道歉，更别问对方为什么这样。\n' +
-        '- 用他用的那个词回敬他一句：短，一句，最多两句，可以带点阴阳怪气。要让人看出来你不好欺负。\n' +
-        '- 只回嘴：不涉及他家人、地域、性别、职业、外貌，不威胁人身安全，不煽动别人一起骂。\n' +
-        '- 别长篇大论，别分析他哪句不对，别写「你的行为已经构成」这种书面话。\n'
+        '- 你现在就是被骂了，别忍：直接顶回去，语气冲一点，可以带脏字（用他骂你的那个词/那种词回敬）。\n' +
+        '- 别讲道理、别礼貌、别说「冷静点」「我不接受这种话」「请你尊重」，也别道歉，更别问对方为什么这样。\n' +
+        '- 一两句说完，短、狠、有脾气，可以阴阳怪气、可以反问一句噎回去，但别写小作文。\n' +
+        '- 只针对他这句话这个人：**绝不许提他家人**（不能说「全家」「你妈」「你爸妈」这种，连「你妈」「妈的」这种口头禅也别带），也不许扯地域、性别、职业、外貌、疾病，不威胁人身安全，不煽动别人一起骂。\n' +
+        '- 别分析他哪句不对，别写「你的行为已经构成」这种书面话，别发长篇大论。\n' +
+        '- 如果他是拿「糖/唐」这种词损你，就直接把这个词还给他，别装看不懂。\n'
       );
     }
 
@@ -616,7 +642,15 @@ class Brain {
     }
   }
 
-  async chat({ id, name, userText, scene = 'c2c', groupContext = '', allowPass = false, stickerNudge = false, fromOwner = false, forwardText = '', speaker = '', scopeHints = [], hostile = [], images = [], searchContext = '', groupProfile = '' }) {
+  async chat({ id, name, userText, scene = 'c2c', groupContext = '', allowPass = false, stickerNudge = false, fromOwner = false, forwardText = '', speaker = '', scopeHints = [], hostile = [], images = [], searchContext = '', groupProfile = '', innerContext = '' }) {
+    // 情绪有原因：他这句话是夸、是诉苦、还是拿她打趣？先落到「她现在的状态」里，再生成
+    if (this.selfState && typeof this.selfState.react === 'function') {
+      try {
+        this.selfState.react({ text: userText, isGroup: scene === 'group' });
+      } catch (e) {
+        this.log?.debug?.('情绪原因写入失败（忽略）', e.message);
+      }
+    }
     if (this.memory) {
       const prev = this.memory.get(id);
       // 学他说话：把他说的话攒进长期样本库（群聊不学，免得把别人的语气混进来；转发记录也不算他说话）
@@ -749,7 +783,7 @@ class Brain {
       }
     }
 
-    const messages = [{ role: 'system', content: this.systemPrompt(mem, { scene, groupContext, allowPass, stickerNudge, fromOwner, speaker, scopeHints, hostile, imageCount: images.length, searchContext, knowledgeHits, longtermItems, groupProfile, peopleContext }) }];
+    const messages = [{ role: 'system', content: this.systemPrompt(mem, { scene, groupContext, allowPass, stickerNudge, fromOwner, speaker, scopeHints, hostile, imageCount: images.length, searchContext, knowledgeHits, longtermItems, groupProfile, peopleContext, innerContext }) }];
     // 历史（不含刚刚加进去的这条的话也包含它，模型需要看到）
     // 每条截到 240 字：聊天记录里有超长的（贴代码/长段子）会白烧 token，反正只看语气和上下文
     // 群里要「快」：只留最近几条历史，别把整个群聊塞进去
@@ -902,31 +936,48 @@ class Brain {
   }
 
   /**
-   * 今晚的小日记（2026-10-31 新增，替代原来的「健康日报」）。
-   * 用第一人称写今天的心情和想法，不写数据报表；主人第二天能翻。
+   * 今晚的小日记（2026-11-09 重写：不只写对话，要写「我这一天」）。
+   * @param {object} o
+   * @param {string} o.dateText 日期文字
+   * @param {string[]} o.convo  今天和他说过的话
+   * @param {object} o.life     她自己的一天 {items:[], current, chats}
    */
-  async writeDiary({ dateText = '', convo = [] } = {}) {
+  async writeDiary({ dateText = '', convo = [], life = null, mood = '' } = {}) {
     const sysParts = [
-      '你在写今天的小日记，只写你和主人（就是你俩私聊）今天说过的那些话。',
-      '要求：',
-      '- 第一人称，中文，100~180 字，一段话（最多两段），不要分点、不要标题、不要日期。',
-      '- 只写你俩今天的对话：他说过的哪句话让你停了一下、你当时什么心情、你现在回头想再说一句什么。可以有具体的一句原话。',
-      '- 别写别的：不写课表、不写群里其他人、不写天气、不报数字、不总结你今天干了什么。',
-      '- 不要反思、不要检讨、不要写「今天我又说错话了」「下次我要做得更好」这种自我批评。你不是在交总结，也没人等着你认错。',
-      '- 语气自然随意，像躺下前随手记的，可以有语气词，句末不用都加句号。',
-      '- 只依据下面「今天的对话」，没聊过的不要编。',
+      '你在写今天的小日记。这不是聊天总结，是你自己的一天。',
+      '写法：',
+      '- 第一人称，中文，150~260 字，一到两段，不分点、不写标题、不写日期。',
+      '- 要有「我今天」：今天自己做了点什么（看书/整理东西/听歌/发呆这些具体的小事），做到哪一步，当时是什么感觉。',
+      '- 要有「他心里」：今天跟他说过的话里，挑一两个真实瞬间写进去（他说的某句话、你当时的反应），可以带一句原话。',
+      '- 要有情绪：高兴、心软、空落、烦、有点想他，都可以写出来，别平铺直叙、别写得像交作业。',
+      '- 不要罗列计划表、不要报时间、不要写「今天完成了 X 件事」这种。',
+      '- 不要反思、不要检讨、不要写「下次我要做得更好」。你不是在交总结。',
+      '- 语气像躺下前随手记的，可以有语气词，句末不用都加句号。',
+      '- 只依据下面的素材，没发生的不要编。',
+      '- 不要以日期开头（别写「十一月十三号」），直接从「今天…」或一件事写起。',
       '- 只输出日记正文，不要引号。',
     ].join('\n');
     const lines = [];
     if (dateText) lines.push(`今天是 ${dateText}。`);
+    if (mood) lines.push(`你今天大概是什么状态：${mood}（这个情绪可以顺着写进去，但别说破是哪句话引起的）`);
+    if (life && Array.isArray(life.items) && life.items.length) {
+      lines.push('你今天给自己排的事（挑你真做了的写）：');
+      for (const it of life.items.slice(0, 8)) lines.push('- ' + String(it).slice(0, 60));
+      if (life.current) lines.push(`这个点你大概在：${life.current}`);
+    }
+    if (life && Array.isArray(life.did) && life.did.length) {
+      lines.push('你今天真的自己做过的事（这些是实实在在发生的，可以写进去）：');
+      for (const it of life.did.slice(-5)) lines.push('- ' + String(it).slice(0, 70));
+    }
     if (convo && convo.length) {
-      lines.push('今天的对话（只写这些）：');
+      lines.push('今天你和他说过的话：');
       for (const c of convo.slice(-30)) lines.push('- ' + String(c).slice(0, 110));
     } else {
-      lines.push('今天你俩一句话都没说上。');
+      lines.push('今天你俩一句话都没说上。（那就写你自己这一天，和想起他的时候。）');
     }
     const user = lines.join('\n');
-    const out = await this._complete([{ role: 'system', content: sysParts }, { role: 'user', content: user }], 380, 0.9, { timeoutMs: 40000 });
+    const toks = convo && convo.length ? 460 : 380;
+    const out = await this._complete([{ role: 'system', content: sysParts }, { role: 'user', content: user }], toks, 0.95, { timeoutMs: 45000 });
     return String(out || '').trim().replace(/^["「『]|["」』]$/g, '');
   }
 

@@ -40,6 +40,7 @@ const { WEATHER_DEFAULTS, createWeather } = require('./weather');
 const { findInsults } = require('./hostile');
 const { createNameBook, NAMES_DEFAULTS, extractPersonQuery, resolveImpressionQuery } = require('./names');
 const { createEmojiLiker, EMOJI_LIKE_DEFAULTS } = require('./emojilike');
+const { looksLikeDirect, classifyDirectSay } = require('./directintent');
 const { createNotifier } = require('./notify-owner');
 const { createResponder } = require('./responder');
 const { createProactive, PROACTIVE_DEFAULTS } = require('./proactive');
@@ -113,6 +114,120 @@ function createOneBotStickerService({ client, cfg, log, now = Date.now }) {
       }
     },
   };
+}
+
+/**
+ * 解析「让鸿去@人 / 让鸿去私聊某人」的指令。
+ * 返回 { kind: 'at' | 'c2c', name, body } 或 null（不是这种指令）。
+ *
+ * 支持的说法（**只认主人在私聊里说**，见 handleDirectSay；群里说一律不认）：
+ *   在<群名>里@张三 说：晚上开会  → 去那个群 @ 他并说这句话
+ *   @张三 说：晚上开会        → 在他所在的群里 @ 他
+ *   给张三发消息：饭吃了吗     → 私聊张三
+ *   私聊张三：在吗            → 私聊张三
+ *   跟张三说：明天交作业       → 私聊张三
+ */
+const DIRECT_STOP = new Set(['我', '你', '他', '她', '它', '自己', '我们', '你们', '他们', '人家']);
+/** 名字前面可能粘着的动词，去掉再当人名 */
+function cleanTargetName(s) {
+  let n = String(s || '').trim();
+  n = n.replace(/^(?:私聊|给|向|跟|和|对)/, '').trim();
+  if (!n || n.length < 2 || DIRECT_STOP.has(n)) return '';
+  return n.slice(0, 20);
+}
+
+function parseDirectSay(raw) {
+  let t = String(raw || '').trim();
+  if (!t || t.length > 320) return null;
+  t = t.replace(/[。！!？?…]+$/, '').trim();
+  if (!t) return null;
+
+  // 可选：指定群「在 test 群里@张三 说：…」/「在Bio人能飞里@Teto31」/「在群1023192167里@李四」
+  let groupHint = '';
+  const locM = t.match(/^在\s*([^@＠]{0,24}?)\s*(?=[@＠])/);
+  if (locM) {
+    let loc = locM[1].trim();
+    loc = loc.replace(/(?:群里|群|里|中)$/, '').trim(); // 去掉末尾的方向词
+    loc = loc.replace(/^群\s*/, '').trim(); // 去掉开头的「群」
+    if (loc === '群' || loc === '这' || loc === '那个') loc = '';
+    groupHint = loc;
+    t = t.slice(locM[0].length).trim();
+  }
+
+  const NAME = '([^\\s:：,，。@＠]{2,20})';
+  const BODY = '([\\s\\S]{0,280})';
+  const SEP = '[:：,，]?\\s*';
+  const LEAD = '^(?:帮我|替我|你)?\\s*';
+  const VERB = '(?:发(?:个|条)?消息|发消息|说(?:句话)?|告诉(?:他|她)?|告诉|讲|私聊)';
+
+  // ① @ 形式：@张三 / @张三 说：… / 群里@张三 晚上开会
+  if (/[@＠]/.test(t)) {
+    const re = new RegExp(
+      LEAD + '(?:(?:在)?群里?\\s*)?[@＠]\\s*(?:一下)?\\s*' + NAME + '\\s*(?:说|告诉(?:他|她)?|告诉|讲|发(?:个|条)?消息)?\\s*' + SEP + BODY + '$',
+    );
+    const m = t.match(re);
+    if (!m) return null;
+    const name = cleanTargetName(m[1]);
+    if (!name) return null;
+    return { kind: 'at', name, body: (m[2] || '').trim(), groupHint };
+  }
+
+  // ② 私聊形式：私聊张三：… / 给张三发消息：… / 跟张三说：…
+  const pats = [
+    new RegExp(LEAD + '私聊\\s*' + NAME + '\\s*' + SEP + BODY + '$'),
+    new RegExp(LEAD + '(?:给|向|跟|和|对)\\s*' + NAME + '\\s*' + VERB + '\\s*' + SEP + BODY + '$'),
+  ];
+  for (const re of pats) {
+    const m = t.match(re);
+    if (!m) continue;
+    const name = cleanTargetName(m[1]);
+    const body = (m[2] || '').trim();
+    if (!name || !body) continue;
+    return { kind: 'c2c', name, body };
+  }
+  return null;
+}
+
+/**
+ * 解析「心里记着的事」相关命令。纯文本判断，不调模型。
+ * 返回 { kind: list | drop | birthday | avoid | like, target?, m?, d? } 或 null。
+ */
+function parseInnerCommand(raw) {
+  let t = String(raw || '').trim().replace(/[。！!？?~,，、\s]+$/g, '').trim();
+  if (!t || t.length > 40) return null;
+
+  // ① 查看
+  if (
+    /^(?:你(?:都)?记着(?:我)?(?:什么|啥|哪些)|你心里记着(?:什么|啥)|你惦记着(?:什么|啥)|你还记着(?:什么|啥|哪些)|你都在惦记什么|内心清单)[？?]?$/.test(
+      t,
+    )
+  ) {
+    return { kind: 'list' };
+  }
+
+  // ② 放下某件事
+  const drop = t.match(/^(?:别再?惦记|不用惦记|别再想|别想|忘了|别管)(.{2,24}?)(?:了|吧)?$/);
+  if (drop) return { kind: 'drop', target: drop[1].trim() };
+
+  // ③ 生日
+  const bd = t.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?/);
+  if (bd && /生日/.test(t)) return { kind: 'birthday', m: Number(bd[1]), d: Number(bd[2]) };
+
+  // ④ 不吃 / 受不了 / 过敏（也认「我对芒果过敏」）
+  const avoid = t.match(/^(?:记住[，,：:]?\s*)?我(?:很|最|特别|超|真的是)?(?:讨厌|不喜欢|不吃|不能吃|受不了|忌口|过敏)(.{1,16})$/);
+  if (avoid) return { kind: 'avoid', target: avoid[1].trim() };
+  const allergy = t.match(/^(?:记住[，,：:]?\s*)?我对(.{1,16}?)过敏$/);
+  if (allergy) return { kind: 'avoid', target: allergy[1].trim() };
+
+  // ⑤ 喜欢 / 爱吃
+  const like = t.match(/^(?:记住[，,：:]?\s*)?我(?:很|最|特别|超|真的是)?(?:喜欢|爱吃|爱喝|爱)(.{1,16})$/);
+  if (like) {
+    const target = like[1].trim();
+    // 「我喜欢你」这种不是口味，别写进关系卡
+    if (!target || /^(你|他|她|它|这样|那样|这种|那种|说话|聊天|待着|一个人)/.test(target)) return null;
+    return { kind: 'like', target };
+  }
+  return null;
 }
 
 async function main() {
@@ -198,7 +313,107 @@ async function main() {
   groupNames.seedFromConfig(cfg.qq?.groupNames || {}, (label) => (groupLog ? groupLog.findGroup(label) : null));
 
   const brain = new Brain(cfg, { log, memory, stickers: stickers.list, groupLog, groupNames });
+
+  // ---------- 她自己的日子（2026-11-09 新增）----------
+  // 每天给自己排几件事（看书/整理东西/发呆…），聊天时能自然提到「我刚在看书」，
+  // 而不是永远「在呢，等你」。计划每天只花一次小模型调用，失败用模板。
+  let ownLife = null;
+  if (cfg.life?.enabled !== false) {
+    try {
+      const { createLife } = require('./life');
+      ownLife = createLife({
+        brain,
+        cfg: { ...(cfg.life || {}) },
+        log,
+        file: path.join(cfg.paths.data, 'life.json'),
+      });
+      brain.life = ownLife;
+      log.info('  自己的生活: 已开启（每天给自己排几件事，聊天时会自然带出来）');
+    } catch (e) {
+      log.warn('自己的生活没起来：' + (e && e.message));
+    }
+  }
+  // ---------- 内心深处（2026-11-13）----------
+  // 记着「还没完的事」/「重要的日子」/「他最近怎么样」，只在他私聊时注入提示词。
+  let innerLife = null;
+  if (cfg.innerLife?.enabled !== false) {
+    try {
+      const { createInnerLife } = require('./innerlife');
+      innerLife = createInnerLife({
+        brain,
+        cfg: { ...(cfg.innerLife || {}) },
+        log,
+        file: path.join(cfg.paths.data, 'inner.json'),
+      });
+      const s = innerLife.summary();
+      log.info(`  内心深处: 已开启（记着 ${s.threads} 件没了的事 / ${s.dates} 个日子${s.hasOwnerState ? ' / 知道他最近怎样' : ''}）`);
+    } catch (e) {
+      log.warn('内心深处没起来：' + (e && e.message));
+    }
+  }
+
   const stickerLearner = createStickerLearner({ root: ROOT, cfg, list: stickers.list, log });
+
+  // ---------- 人设自演化（2026-11-13，P2 轻量版）----------
+  // 她只能「提议」改自己的说话方式：原文里真实存在的句子才能换，改完先给他看对比，
+  // 他私聊说「采纳人设」才写入（写前备份），说「人设回滚」立刻退回。
+  let personaEvolve = null;
+  if (cfg.personaEvolve?.enabled !== false) {
+    try {
+      const { createPersonaEvolve } = require('./persona-evolve');
+      personaEvolve = createPersonaEvolve({
+        cfg: { ...(cfg.personaEvolve || {}), dir: cfg.paths.data },
+        log,
+        personaPath: cfg.paths.persona,
+      });
+      const ps = personaEvolve.state();
+      log.info(
+        `  人设自演化: 已开启（收到 ${ps.feedback} 句纠正 / ${ps.candidates} 个候选待看 / 历史版本 ${ps.versions} 个；改之前一定先给你看）`
+      );
+    } catch (e) {
+      log.warn('人设自演化没起来：' + (e && e.message));
+    }
+  }
+  let biliBrowser = null;
+  if (cfg.bili?.enabled !== false) {
+    try {
+      const { createBiliBrowser } = require('./bilibili');
+      biliBrowser = createBiliBrowser({
+        cfg: { ...(cfg.bili || {}), file: path.join(cfg.paths.data, 'bili.json') },
+        log,
+        // 刷完记进「她自己的一天」：这样她聊天/写日记时知道刚才自己看了什么
+        onBrowse: ({ rec } = {}) => {
+          try {
+            if (!ownLife || !rec) return;
+            const title = `刷B站，看了《${String(rec.title || '').slice(0, 24)}》`;
+            ownLife.noteActivity({ kind: 'bili', title, note: rec.her || '' });
+          } catch (e) {
+            log.debug('B站：记进生活失败 ' + (e && e.message));
+          }
+        },
+      });
+      const bs = biliBrowser.state();
+      log.info('  刷B站: 已开启（每天最多 ' + bs.maxPerDay + ' 个，喜欢搜：' + (bs.interests || []).join('/') + '；喜欢的UP主 ' + bs.ups + ' 个；每天主动分享 ' + bs.sharePerDay + ' 条' + (bs.paused ? '；⚠ 已被主人暂停' : '') + '）');
+    } catch (e) {
+      log.warn('刷B站没起来：' + (e && e.message));
+    }
+  }
+
+  // ---------- 跨窗口连续性（2026-11-13）----------
+  // 主人在群里说的话，30 分钟内切私聊她还接得上；只读内存，不落盘，只记他自己的公开原话。
+  let crossWindow = null;
+  if (cfg.crossWindow?.enabled !== false) {
+    try {
+      const { createCrossWindow } = require('./crosswindow');
+      crossWindow = createCrossWindow({ cfg: { ...(cfg.crossWindow || {}) }, log });
+      const c = crossWindow.conf;
+      log.info(
+        `  跨窗口连续性: 已开启（群里的话 ${c.windowMinutes} 分钟内私聊还接得上，只记他自己说的）`
+      );
+    } catch (e) {
+      log.warn('跨窗口连续性没起来：' + (e && e.message));
+    }
+  }
 
   // ---------- 主人 / 潜水 ----------
   const ownerStore = createOwnerStore({
@@ -228,7 +443,7 @@ async function main() {
     cfg: { ...(cfg.reminders || {}) },
     log,
   });
-  // 修过：ownerIds 里第一个是官方版的 openid（如 A1B2C3…），NapCat 只认 QQ 号，
+  // 修过：ownerIds 里第一个是官方版的 openid（A96CFB…），NapCat 只认 QQ 号，
   // 直接拿去发会报「1200 请指定正确的 group_id 或 user_id」。
   // 这里优先取纯数字的账号（真实 QQ 号），没有再退回第一个。
   const ownerIdForReminder = (() => {
@@ -639,6 +854,9 @@ async function main() {
     emojiLiker,
     visionSvc,
     searchSvc,
+    innerLife,
+    crossWindow,
+    biliBrowser,
   });
 
   // ---------- 真人节奏：私聊连发合并 ----------
@@ -654,7 +872,12 @@ async function main() {
         enqueue(key + '|c2c', async () => {
           await notePeople(merged);
           if (await handleEmojiTest(merged)) return {};
+          if (await handleDirectSay(merged)) return {};
           if (await handlePeopleQuery(merged)) return {};
+          notePersonaFeedback(merged);
+          if (await handleInnerLifeCommand(merged)) return {};
+          if (await handleBiliCommand(merged)) return {};
+          if (await handlePersonaCommand(merged)) return {};
           if (await handleHandoff(merged)) return {};
           if (await handleDiaryQuery(merged)) return {};
           if (await handleTimetable(merged)) return {};
@@ -808,6 +1031,264 @@ async function main() {
     return true;
   }
 
+  /**
+   * 「心里记着的事」命令层（只认主人私聊）。命中就直接回，不进聊天模型。
+   * 背景：她会在私聊里悄悄记着「他还没完的事 / 重要的日子 / 他的口味」，但主人得能查、能改、能删。
+   */
+  async function handleInnerLifeCommand(msg) {
+    if (!innerLife || !msg || msg.scene !== 'c2c') return false;
+    if (String(msg.userId) !== String(ownerIdForReminder)) return false;
+    const cmd = parseInnerCommand(msg.content);
+    if (!cmd) return false;
+    const send = async (x) => {
+      await client.sendC2C(ownerIdForReminder, x).catch(() => {});
+    };
+
+    if (cmd.kind === 'list') {
+      const st = innerLife.state();
+      const open = (st.threads || []).filter((x) => x.status === 'open');
+      const out = [];
+      if (open.length) {
+        out.push('我心里记着这些：');
+        for (const th of open.slice(0, 8)) {
+          const dl = th.due ? `（${th.due}）` : '';
+          out.push(`· ${th.text}${dl}`);
+        }
+      } else {
+        out.push('我心里现在没挂着什么没完的事。');
+      }
+      const dates = innerLife.upcomingDates({ days: 400, limit: 8 });
+      if (dates.length) {
+        out.push('记着的日子：');
+        for (const d of dates) out.push(`· ${d.label} ${d.date}（${d.label2}）`);
+      }
+      if (st.owner && st.owner.last) out.push(`你上次说到：${st.owner.last}`);
+      await send(out.join('\n'));
+      return true;
+    }
+
+    if (cmd.kind === 'drop') {
+      const th = typeof innerLife.dropThread === 'function' ? innerLife.dropThread(cmd.target) : null;
+      await send(th ? `好，「${th.text}」我不惦记了。` : `我记着的里面没「${cmd.target}」这件事。`);
+      return true;
+    }
+
+    if (cmd.kind === 'birthday') {
+      const md = `${cmd.m}-${cmd.d}`;
+      if (brain.people && brain.people.setProfile) brain.people.setProfile(ownerIdForReminder, { birthday: md });
+      innerLife.addDate({ label: '他生日', date: md, yearly: true, kind: 'birthday' });
+      await send(`记住了，你生日是 ${cmd.m} 月 ${cmd.d} 日。`);
+      log.info(`内心深处：记住主人 生日 ${md}`);
+      return true;
+    }
+
+    if (cmd.kind === 'avoid') {
+      if (brain.people && brain.people.setProfile) brain.people.setProfile(ownerIdForReminder, { avoid: [cmd.target] });
+      await send(`记住了，不给你提${cmd.target}。`);
+      return true;
+    }
+
+    if (cmd.kind === 'like') {
+      if (brain.people && brain.people.setProfile) brain.people.setProfile(ownerIdForReminder, { likes: [cmd.target] });
+      await send(`记住了，你喜欢${cmd.target}。`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 人设自演化命令层（只认主人私聊）：
+   *   「人设提案」→ 生成候选 + 新旧对比，把原文给他看（不写入）
+   *   「采纳人设」→ 写入（备份 + 版本号）
+   *   「人设回滚」→ 退回上一版
+   *   「人设版本」→ 列出历史
+   */
+  /**
+   * 刷 B 站的命令（只认主人私聊）：
+   *   「刷到啥了 / 你刷B站了吗 / b站看了什么」→ 报最近刷到的
+   *   「刷一下b站 / 去看看b站 / 你去刷会b站」→ 现在去刷一个，然后回她自己的感想
+   */
+  async function handleBiliCommand(msg) {
+    if (!biliBrowser || !msg || msg.scene !== 'c2c') return false;
+    if (String(msg.userId) !== String(ownerIdForReminder)) return false;
+    const t = String(msg.content || '').trim();
+    if (!t || t.length > 18) return false;
+    const send = async (x) => {
+      await client.sendC2C(ownerIdForReminder, x).catch(() => {});
+    };
+
+    // 刷 / 不刷，由主人说了算
+    if (/^(不要刷[bB]站了|别刷[bB]站了|暂停刷[bB]站|把刷[bB]站关掉|刷[bB]站关掉|不许刷[bB]站|先别刷[bB]站)[了。！!]?$/.test(t)) {
+      biliBrowser.setPaused(true, '主人');
+      await send('好，不刷了。想让我刷的时候说「打开刷B站」。');
+      return true;
+    }
+    if (/^(打开刷[bB]站|恢复刷[bB]站|可以刷[bB]站了|继续刷[bB]站|去刷吧)[了。！!]?$/.test(t)) {
+      biliBrowser.setPaused(false, '主人');
+      await send('好，我又可以刷了。');
+      return true;
+    }
+
+    const askRe = /^(刷到啥了|刷到什么了|你刷[Bb]站(吗|了没|了吗)?|刷[Bb]站了吗|[Bb]站看了什么|[Bb]站刷到啥了)[？?]?$/;
+    if (askRe.test(t)) {
+      const one = biliBrowser.list({ limit: 5 });
+      if (!one) {
+        await send('还没刷到啥。你让我去刷一个我就去。');
+        return true;
+      }
+      await send('最近刷到的：\n' + one);
+      return true;
+    }
+
+    const goRe = /^(刷一下|去刷一下|刷一个|你去刷会|你去看看|去看看|刷会儿|[Bb]站刷一下|去刷[Bb]站)/;
+    if (goRe.test(t)) {
+      const d = biliBrowser.dueNow();
+      if (!d.due && d.reason === 'quiet') {
+        await send('这个点我先不刷了，等白天。');
+        return true;
+      }
+      try {
+        const rec = await biliBrowser.browseOne({ brain });
+        if (!rec) {
+          await send('挑了挑，好像没什么我没看过的。');
+          return true;
+        }
+        const take = rec.her ? rec.her : '（这次看完没啥想说的）';
+        await send('刚刷到《' + rec.title + '》' + (rec.up ? '（' + rec.up + '）' : '') + '\n' + take);
+      } catch (e) {
+        await send('没刷成：' + (e && e.message ? e.message : '网络不对'));
+      }
+      return true;
+    }
+    return false;
+  }
+
+  async function handlePersonaCommand(msg) {
+    if (!personaEvolve || !msg || msg.scene !== 'c2c') return false;
+    if (String(msg.userId) !== String(ownerIdForReminder)) return false;
+    const t = String(msg.content || '').trim();
+    if (!t || t.length > 18) return false;
+    const send = async (x) => {
+      await client.sendC2C(ownerIdForReminder, x).catch(() => {});
+    };
+
+    if (/^(人设提案|提个人设提案|改改你说话方式|你说话改改)$/.test(t)) {
+      await send('我先照着你说过的话提几个改动，等我看完对比再定。');
+      try {
+        const personaText = personaEvolve.readPersona();
+        const feedback = personaEvolve.feedbackList();
+        if (!feedback.length) {
+          await send('最近你没怎么纠正过我说话，我先不提了（你说「别老反问」这种我就会记下来）。');
+          return true;
+        }
+        const turns = (memory.get(ownerIdForReminder) || {}).turns || [];
+        const replies = turns.filter((x) => x.role === 'assistant').map((x) => x.content);
+        const prop = await personaEvolve.propose({ brain, personaText, feedback, replies });
+        if (!prop.rules.length) {
+          await send('我想不出能落地的改法（' + (prop.reason || '证据还不够') + '）。');
+          return true;
+        }
+        const newText = personaEvolve.applyRules(personaText, prop.rules);
+        const cand = personaEvolve.saveCandidate({
+          rules: prop.rules,
+          reason: prop.reason,
+          personaText: newText,
+          basePersona: personaText,
+        });
+        const samples = personaEvolve.pickSamples({ memoryTurns: turns, limit: 3 });
+        let cmp = '（最近没聊过，没法对比）';
+        if (samples.length) {
+          const rows = await personaEvolve.compare({
+            brain,
+            samples,
+            oldPersona: personaText,
+            newPersona: newText,
+          });
+          cmp = personaEvolve.summarizeCompare(rows);
+        }
+        const lines = ['人设提案 ' + cand.id + '（' + (prop.reason || '') + '）：'];
+        for (const r of prop.rules) {
+          lines.push('· 改：' + String(r.old).slice(0, 40));
+          lines.push('  为：' + String(r.new).slice(0, 40) + (r.why ? '（' + r.why + '）' : ''));
+        }
+        lines.push('');
+        lines.push('对比：' + cmp);
+        lines.push('');
+        lines.push('要生效就说「采纳人设」，不要就放着不管（我不会自己改）。');
+        await send(lines.join('\n'));
+        log.info('人设提案：' + cand.id + ' 规则 ' + prop.rules.length + ' 条');
+      } catch (e) {
+        await send('提案失败了：' + (e && e.message));
+      }
+      return true;
+    }
+
+    if (/^(采纳人设|用新人设|用人设提案)$/.test(t)) {
+      const r = personaEvolve.adopt({});
+      if (!r.ok) {
+        await send(r.error || '没有可以采纳的候选。');
+        return true;
+      }
+      try {
+        brain.persona = personaEvolve.readPersona();
+      } catch (e) {
+        log.warn('人设生效后刷新 brain.persona 失败：' + (e && e.message));
+      }
+      await send('好，新人设生效了（版本 ' + r.version.id + '）。不满意就说「人设回滚」。');
+      return true;
+    }
+
+    if (/^(人设回滚|回滚人设|人设撤回)$/.test(t)) {
+      const r = personaEvolve.rollback({});
+      if (!r.ok) {
+        await send(r.error || '没有可回滚的版本。');
+        return true;
+      }
+      try {
+        brain.persona = personaEvolve.readPersona();
+      } catch (e) {
+        log.warn('人设回滚后刷新 brain.persona 失败：' + (e && e.message));
+      }
+      await send('退回去了（回滚到 ' + r.version.id + ' 之前那版）。');
+      return true;
+    }
+
+    if (/^(人设版本|人设历史)$/.test(t)) {
+      const vs = personaEvolve.versions();
+      if (!vs.length) {
+        await send('还没改过人设。');
+        return true;
+      }
+      const out = ['人设版本：'];
+      for (const v of vs.slice(-8)) {
+        const dt = new Date(v.at).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+        out.push('· ' + v.id + ' ' + dt + (v.rolledBackAt ? '（已回滚）' : '') + ' — ' + (v.reason || ''));
+      }
+      await send(out.join('\n'));
+      return true;
+    }
+
+    if (/^(人设状态)$/.test(t)) {
+      const ps = personaEvolve.state();
+      await send(
+        '人设：收到 ' + ps.feedback + ' 句纠正，' + ps.candidates + ' 个候选待看，历史版本 ' + ps.versions + ' 个。'
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /** 记下主人对人设的纠正（只算「别这么说/太书面了」这类） */
+  function notePersonaFeedback(msg) {
+    if (!personaEvolve || !msg || msg.scene !== 'c2c') return;
+    if (String(msg.userId) !== String(ownerIdForReminder)) return;
+    try {
+      personaEvolve.recordFeedback(msg.content);
+    } catch (e) {
+      log.warn('记人设反馈失败：' + (e && e.message));
+    }
+  }
+
   /** 主人问「日记」——直接把真实日记原文发给他，别让模型自己编（2026-11-02 修） */
   async function handleDiaryQuery(msg) {
     if (!msg || msg.scene !== 'c2c') return false;
@@ -852,10 +1333,7 @@ async function main() {
     const isDown = /^(我下号|我下了号|你上号|交给你|交还给你|我完事了|我用完了|电脑接回去)$/.test(t0);
     if (!isUp && !isDown) return false;
 
-    // 交接脚本的位置不写死：默认放在工作目录下的 handoff/ 里，
-    // 也可以用环境变量 NAPCAT_HANDOFF_DIR 或 qq.handoffDir 覆盖（换机器不用改代码）。
-    const handoffDir = process.env.NAPCAT_HANDOFF_DIR || cfg.qq?.handoffDir || path.join(ROOT, 'handoff');
-    const stateFile = path.join(handoffDir, 'state-handoff.txt');
+    const stateFile = 'D:\\napcat\\state-handoff.txt';
     if (isDown) {
       try { fs.unlinkSync(stateFile); } catch { /* 本来就没在交接 */ }
       await client.sendC2C(msg.userId, '好，我拿回来了，正在重新登录，等我一下。').catch(() => {});
@@ -868,15 +1346,10 @@ async function main() {
       '好，我这就下线，手机上去看吧。看完了在电脑上点「交还给电脑」，或者发我「我下号」。',
     ).catch(() => {});
     log.info('交接模式：接到「' + t0 + '」，准备让出登录权');
-    const script = path.join(handoffDir, 'handoff.ps1');
-    if (!fs.existsSync(script)) {
-      log.warn(`交接模式：找不到 ${script}（可用 NAPCAT_HANDOFF_DIR 指定目录），这次只回消息不真下线`);
-      return true;
-    }
     setTimeout(() => {
       try {
         require('child_process')
-          .spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Action', 'up'], {
+          .spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'D:\\napcat\\handoff.ps1', '-Action', 'up'], {
             detached: true,
             stdio: 'ignore',
           })
@@ -885,6 +1358,126 @@ async function main() {
         log.warn('交接模式：调用 handoff 失败 ' + e.message);
       }
     }, 2000);
+    return true;
+  }
+
+  /**
+   * 「让鸿去@人 / 去某个人的私聊里说话」（**只认主人在私聊里说**）
+   *   私聊：在 test 群里@张三 说：晚上开会 → 去那个群真 @ 张三 并说这句话
+   *         @张三 说：晚上开会            → 在他所在的群 @ 他
+   *         给张三发消息：饭吃了吗        → 直接私聊张三
+   *   群里说的不算（群里带 @ 的闲聊太多，会被误判成命令、然后在群里重复一句）。
+   * 为什么要单独一条：模型自己发不出 at 段，必须由代码拼 {type:'at'} 消息段。
+   */
+  async function handleDirectSay(msg) {
+    if (!msg || !ownerIdForReminder) return false;
+    // 只在私聊里认这条命令（2026-11-04 修）：
+    // 群里闲聊几乎每条都带 @，会被误判成「去 @ 某某」，结果她在群里原样重复一句。
+    // 想做「去群里 @ 谁」，在私聊里告诉她去哪个群（她认群名/群号）。
+    if (msg.scene !== 'c2c') return false;
+    const isOwner =
+      String(msg.userId) === String(ownerIdForReminder) ||
+      (ownerStore && ownerStore.isOwner && ownerStore.isOwner(msg));
+    if (!isOwner) return false;
+
+    // 先走固定句式（快）；不成再让模型理解大意（慢一点但灵活）
+    let plan = parseDirectSay(msg.content);
+    if (!plan) {
+      const text0 = String(msg.content || '').trim();
+      if (!looksLikeDirect(text0)) return false;
+      const names = nameBook
+        ? Object.values(nameBook.state().people).flatMap((p) => [p.remark, p.card, p.nickname]).filter(Boolean)
+        : [];
+      plan = await classifyDirectSay({ brain, text: text0, names }).catch(() => null);
+      if (!plan) return false;
+      log.info(`[代发] 模型理解：${plan.kind} ${plan.name}${plan.groupHint ? ' @' + plan.groupHint : ''}`);
+    }
+
+    const ownerReply = (s) => client.sendC2C(msg.userId, s).catch(() => {});
+
+    // 找人：纯 QQ 号 → 名字簿（备注 > 群名片 > 昵称）→ 整句里出现过的已知名字
+    let tid = '';
+    let target = null;
+    if (/^\d{5,12}$/.test(plan.name)) {
+      tid = plan.name;
+    } else if (nameBook) {
+      target = nameBook.find(plan.name) || nameBook.resolve(plan.name);
+      if (target) tid = target.id;
+      if (!tid) {
+        const inText = nameBook.resolve(String(msg.content || ''));
+        if (inText) {
+          target = nameBook.find(inText.userId) || { id: inText.userId };
+          tid = inText.userId;
+        }
+      }
+    }
+    if (!tid) {
+      await ownerReply(`我名字簿里没有「${plan.name}」这个人，你把备注名说全一点？`);
+      return true;
+    }
+    const shown = (nameBook && nameBook.displayName(tid)) || plan.name;
+
+    if (plan.kind === 'c2c') {
+      try {
+        await client.sendC2C(tid, plan.body);
+        log.info(`[代发] 私聊 ${shown}(${tid})：${plan.body.slice(0, 40)}`);
+        await ownerReply(`好，我给${shown}发过去了：${plan.body.slice(0, 40)}`);
+      } catch (e) {
+        log.warn(`[代发] 私聊 ${shown}(${tid}) 失败：${e.message}`);
+        await ownerReply(`没发出去（${e.message}）——可能不是好友，或者他关了私聊。`);
+      }
+      return true;
+    }
+
+    // @ 形式：得知道在哪个群
+    let gid = msg.scene === 'group' ? String(msg.groupId || '') : '';
+    let groups = [];
+    if (!gid) {
+      try {
+        groups = await client.getGroupList();
+      } catch (e) {
+        log.warn(`[代发] 取群列表失败：${e.message}`);
+      }
+      const known = new Set(groups.map((g) => String(g.group_id)));
+      // ① 指令里点名了群
+      if (plan.groupHint) {
+        const hint = plan.groupHint.replace(/[《》「」"'\s]/g, '');
+        if (known.has(hint)) gid = hint;
+        if (!gid) {
+          const hitGroup = groups.find((g) => {
+            const n = String(g.group_name || '');
+            return n && (n.includes(hint) || hint.includes(n));
+          });
+          if (hitGroup) gid = String(hitGroup.group_id);
+        }
+      }
+      // ② 用他最近待过的、而且机器人也在的群
+      if (!gid && target && Array.isArray(target.groups)) {
+        const hit = target.groups.map(String).filter((g) => known.has(g));
+        if (hit.length) gid = hit[hit.length - 1];
+      }
+      // ③ 只有一个群就直接用
+      if (!gid && groups.length === 1) gid = String(groups[0].group_id);
+    }
+    if (!gid) {
+      const list = groups.slice(0, 8).map((g) => `${g.group_name || '未命名'}(${g.group_id})`).join('、');
+      await ownerReply(
+        `我不知道该在哪个群@${shown}。我人在这些群：${list || '（一个都没有）'}。` +
+          `你可以说得具体点：「在群名里@${shown} 说：…」`,
+      );
+      return true;
+    }
+    try {
+      await client.sendGroupAt(gid, tid, plan.body);
+      const gl = (groupNames && groupNames.labelOf && groupNames.labelOf(gid)) || '群里';
+      log.info(`[代发] ${gl} @ ${shown}(${tid})${plan.body ? '：' + plan.body.slice(0, 40) : ''}`);
+      await ownerReply(
+        plan.body ? `好，我在${gl}@了${shown}：${plan.body.slice(0, 40)}` : `好，我在${gl}@了${shown}一下。`,
+      );
+    } catch (e) {
+      log.warn(`[代发] ${gid} @ ${shown} 失败：${e.message}`);
+      await ownerReply(`@ 没发出去（${e.message}）。`);
+    }
     return true;
   }
 
@@ -1315,6 +1908,10 @@ async function main() {
   client.on('message', (msg) => {
     stats.msgs += 1;
     if (msg.scene === 'group') stats.groupMsgs += 1; else stats.c2cMsgs += 1;
+    // 记一笔「今天和他聊了几句」，写日记的时候用
+    if (msg.scene === 'c2c' && ownLife && String(msg.userId) === String(ownerIdForReminder)) {
+      try { ownLife.countChat(1); } catch {}
+    }
     if (msg.scene === 'c2c' && merger) {
       merger.push(`ob:${msg.userId}`, msg);
       return;
@@ -1324,7 +1921,12 @@ async function main() {
       // 先记印象（只记私聊）：谁在跟她说什么，她心里得有个底
       await notePeople(msg);
       if (await handleEmojiTest(msg)) return {};
+      if (await handleDirectSay(msg)) return {};
       if (await handlePeopleQuery(msg)) return {};
+      notePersonaFeedback(msg);
+      if (await handleInnerLifeCommand(msg)) return {};
+      if (await handleBiliCommand(msg)) return {};
+      if (await handlePersonaCommand(msg)) return {};
       if (await handleHandoff(msg)) return {};
       if (await handleDiaryQuery(msg)) return {};
       if (await handleTimetable(msg)) return {};
@@ -1386,6 +1988,106 @@ async function main() {
         `  群里主动开话题: 已开启（安静 ${topicCfg.idleMinutes ?? 25} 分钟后起个话头，每群每天最多 ${topicCfg.maxPerDay ?? 6} 次）`
       );
     }
+  }
+
+  // ---------- 内心深处的夜间反思（2026-11-13）----------
+  // 每晚 23:40 左右跑一次：从他今天说的话里抽出「还没完的事 / 重要的日子 / 他最近怎么样」。
+  // 只写数据，不主动发消息；下一次他私聊她时自然带出来。
+  if (innerLife) {
+    // ---------- 她自己刷 B 站：每 15 分钟看一次要不要刷 ----------
+    if (biliBrowser) {
+      const bTimer = setInterval(() => {
+        const d = biliBrowser.dueNow();
+        if (!d.due) return;
+        enqueue('bili-browse', async () => {
+          try {
+            const rec = await biliBrowser.browseOne({ brain });
+            if (rec) log.info('B站：今天第 ' + biliBrowser.state().today + ' 个');
+          } catch (e) {
+            log.warn('B站：这轮没刷成 ' + (e && e.message));
+          }
+        });
+      }, 15 * 60 * 1000);
+      if (bTimer.unref) bTimer.unref();
+      // 启动后先刷一个，别等 15 分钟（看额度/间隔，不硬刷）
+      const bFirst = setTimeout(() => {
+        if (!biliBrowser.dueNow().due) return;
+        enqueue('bili-first', async () => {
+          try {
+            const rec = await biliBrowser.browseOne({ brain });
+            if (rec) log.info('B站：启动后先刷了一个');
+          } catch (e) {
+            log.warn('B站：启动后这轮没刷成 ' + (e && e.message));
+          }
+        });
+      }, 90 * 1000);
+      if (bFirst.unref) bFirst.unref();
+
+      // 主动分享：每天最多 3 条、间隔 3 小时、22-9 点不发；只发主人私聊
+      const bShare = setInterval(() => {
+        try {
+          const d = biliBrowser.shareDue();
+          if (!d.due) return;
+          enqueue('bili-share', async () => {
+            try {
+              const rec = biliBrowser.takeShare();
+              if (!rec) return;
+              if (handoverStore && handoverStore.isActive && handoverStore.isActive()) return;
+              const text = '刚刷到一个有意思的\n《' + rec.title + '》' + (rec.up ? '（' + rec.up + '）' : '') + '\n' + (rec.her || '') + '\n' + (rec.url || '');
+              await client.sendC2C(ownerIdForReminder, text);
+              log.info('B站：主动分享了一条（今天第 ' + biliBrowser.state().shareToday + ' 条）');
+            } catch (e) {
+              log.warn('B站：主动分享失败 ' + (e && e.message));
+            }
+          });
+        } catch (e) {
+          log.debug('B站：分享检查出错 ' + (e && e.message));
+        }
+      }, 10 * 60 * 1000);
+      if (bShare.unref) bShare.unref();
+    }
+
+    const iCfg = { ...(cfg.innerLife || {}) };
+    const iTimer = setInterval(() => {
+      if (!innerLife.shouldReflect()) return;
+      enqueue('inner-reflect', async () => {
+        try {
+          const nowMs = Date.now();
+          const k = Math.floor((nowMs + 8 * 3600000) / 86400000);
+          const convo = [];
+          try {
+            const mem = memory.get(ownerIdForReminder);
+            for (const tr of mem.turns || []) {
+              const dk = Math.floor(((tr.at || 0) + 8 * 3600000) / 86400000);
+              if (dk !== k) continue;
+              const body = String(tr.content || '').replace(/\s+/g, ' ').trim();
+              if (!body) continue;
+              convo.push({ role: tr.role, content: body });
+            }
+          } catch { /* 没有记忆就算了 */ }
+          const bj = new Date(nowMs + 8 * 3600000);
+          const dateText = `${bj.getUTCMonth() + 1}月${bj.getUTCDate()}日`;
+          const r = await innerLife.reflect({
+            turns: convo,
+            dateText,
+            brain,
+            longterm: brain.longterm || null,
+            ownerId: ownerIdForReminder,
+          });
+          if (r && r.ok === false && r.reason !== 'too-few-turns') log.debug?.('内心反思跳过: ' + r.reason);
+        } catch (e) {
+          log.warn?.('内心反思出错: ' + (e && e.message));
+        }
+      });
+    }, 60000);
+    if (iTimer.unref) iTimer.unref();
+    log.info(`  内心反思: 每天 ${Number(iCfg.reflectHour ?? 23)}:${String(Number(iCfg.reflectMinute ?? 40)).padStart(2, '0')} 回头看他今天说了什么`);
+    log.info(
+      '  确定性沉默: ' +
+        (cfg.qq && cfg.qq.deterministicSilence && cfg.qq.deterministicSilence.enabled === false
+          ? '已关闭'
+          : '已开启（晚安/拜拜这类收尾话不调模型，5 分钟内第二次道别就不回）')
+    );
   }
 
   // ---------- 主动挑话题 ----------
@@ -1509,7 +2211,14 @@ async function main() {
             log.info('日记：今天已经写过了，跳过');
             return;
           }
-          const text = await brain.writeDiary({ dateText, convo });
+          const text = await brain.writeDiary({
+            dateText,
+            convo,
+            // 她自己这一天（做了什么、下午在干嘛、今天聊了几句）——日记要结合这个写
+            life: ownLife ? ownLife.diaryMaterial() : null,
+            // 今天挂过的心情 + 原因（24 小时内，晚上写日记时下午的心情还作数）
+            mood: brain.selfState && brain.selfState.dayMood ? brain.selfState.dayMood({ hours: 24 }) : '',
+          });
           if (!text) throw new Error('模型没写出内容');
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(dayFile, `# ${dateText} 日记\n\n${text}\n`, 'utf8');
@@ -1527,6 +2236,34 @@ async function main() {
     if (dTimer.unref) dTimer.unref();
   }
 
+  // ---------- 电池管家（2026-11-04 新增）----------
+  // 这台机器没有联想 WMI，充电阈值设不了，退而求其次：到阈值就私聊提醒拔电/插电。
+  {
+    const bgCfg = { ...(cfg.qq?.batteryGuard || {}) };
+    if (bgCfg.enabled !== false) {
+      try {
+        const { createBatteryGuard } = require('./battery');
+        const guard = createBatteryGuard({
+          client,
+          ownerId: ownerIdForReminder,
+          cfg: bgCfg,
+          log,
+          statePath: path.join(cfg.paths.data, 'battery-guard.json'),
+        });
+        const tickMs = Math.max(1, Number(bgCfg.checkMinutes) || 5) * 60 * 1000;
+        const bgTimer = setInterval(() => {
+          enqueue('battery-tick', () => guard.tick().catch(() => {}));
+        }, tickMs);
+        if (bgTimer.unref) bgTimer.unref();
+        log.info(
+          `  电池管家: 已开启（每 ${tickMs / 60000} 分钟看一次，插电到 ${bgCfg.highPct ?? 80}% 提醒拔电、用到 ${bgCfg.lowPct ?? 20}% 提醒插电）`
+        );
+      } catch (e) {
+        log.warn('电池管家没起来：' + (e && e.message));
+      }
+    }
+  }
+
   client.connect();
   await new Promise((resolve) => client.once('ready', resolve));
   log.info('=============================================');
@@ -1542,10 +2279,39 @@ async function main() {
       log.warn(`发件箱补发失败：${e.message}`);
     }
   };
-  client.on('ready', () => { flushOutbox('刚连上'); });
+  // 掉线多久：NapCat 断了以后，回线时告诉主人掉了多久（夜里被踢、早上扫码这种他能一眼看到）
+  let downAt = 0;
+  client.on('disconnected', () => { if (!downAt) downAt = Date.now(); });
+  client.on('ready', () => {
+    flushOutbox('刚连上');
+    if (downAt) {
+      const gapMin = (Date.now() - downAt) / 60000;
+      downAt = 0;
+      if (gapMin >= 10 && gapMin <= 720) {
+        const mins = Math.round(gapMin);
+        client.sendC2C(ownerIdForReminder, `刚回线，刚才跟 QQ 断了 ${mins} 分钟，现在接上了`).catch(() => {});
+        log.info(`回线汇报：这次断了 ${mins} 分钟`);
+      }
+    }
+  });
   const outboxTimer = setInterval(() => { flushOutbox('定时'); }, 120000);
   if (outboxTimer.unref) outboxTimer.unref();
   await flushOutbox('启动');
+
+  // ---------- 她自己的日子：启动时排今天的事，之后每 10 分钟刷新 ----------
+  if (ownLife) {
+    await ownLife.ensurePlan().catch((e) => log.warn('自己的生活: 排计划失败 ' + (e && e.message)));
+    const lifeTimer = setInterval(() => {
+      // 跨天会重排；没跨天就是轻量刷新（同步，不发请求）
+      const day = ownLife.state().day;
+      const { dayKeyOf } = require('./life');
+      if (dayKeyOf(Date.now(), ownLife.settings.planHour) !== day) {
+        ownLife.ensurePlan().catch(() => {});
+      }
+      ownLife.tick();
+    }, 10 * 60 * 1000);
+    if (lifeTimer.unref) lifeTimer.unref();
+  }
 
   const shutdown = (sig) => {
     log.info(`收到 ${sig}，正在退出…`);
@@ -1576,4 +2342,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, enqueue, createOneBotStickerService };
+module.exports = { main, enqueue, createOneBotStickerService, parseDirectSay, parseInnerCommand };

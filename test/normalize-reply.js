@@ -31,6 +31,16 @@ if (t4 !== 'ok I am fine') { console.log(`FAIL 英文空格被误删: ${t4}`); b
 const t5 = normalizeReply('今天 5°~11°，降水 53%');
 if (t5 !== '今天5°~11°，降水53%') { console.log(`FAIL 数字空格: ${t5}`); bad++; }
 
+// 模型抄历史里的日期标注：开头/每行的「[11月4日]」都要去掉
+const d1 = normalizeReply('[11月4日] 嗯，我在');
+if (d1 !== '嗯，我在') { console.log(`FAIL 日期前缀没删: ${JSON.stringify(d1)}`); bad++; }
+const d2 = normalizeReply('[11月4日] 是有那么点\n[11月4日] 一天没怎么说话');
+if (/月\s*\d{1,2}\s*[日号]/.test(d2)) { console.log(`FAIL 多行日期没删: ${JSON.stringify(d2)}`); bad++; }
+const d3 = normalizeReply('【11月4日 周三】好');
+if (d3 !== '好') { console.log(`FAIL 中文括号日期没删: ${JSON.stringify(d3)}`); bad++; }
+const d4 = normalizeReply('[11:30] 嗯');
+if (d4 !== '[11:30] 嗯') { console.log(`FAIL 不该动时间方括号: ${JSON.stringify(d4)}`); bad++; }
+
 // 兜底补标点：一长串没有任何标点的文字，末尾要补句号
 const { splitReply } = require(path.join(ROOT, 'src/responder'));
 const long = splitReply('今天下午我在图书馆一直坐着看书看到天都黑了也没注意时间', 200);
